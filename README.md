@@ -116,10 +116,13 @@ HighSeaSagaDXTrainer/
 
 ```bash
 # 关闭游戏，将某次备份覆盖到游戏存档目录
-# 示例（PowerShell）：
-Copy-Item -Recurse "D:\workplace\HighSeaSagaDXTrainer\backups\20261115-143501-644742\saves\*" `
-          "E:\SteamLibrary\steamapps\common\High Sea Saga DX\saves\"
+# 示例（PowerShell，请将路径替换为你的实际路径）：
+Copy-Item -Recurse ".\backups\<时间戳文件夹>\saves\*" `
+          "<游戏安装目录>\saves\"
 ```
+
+> - `<时间戳文件夹>` 形如 `20261115-143501-644742`，在 `backups/` 下可看到
+> - `<游戏安装目录>` 为 Steam 版通常在 `E:\SteamLibrary\steamapps\common\High Sea Saga DX`，请按实际情况修改
 
 ---
 
