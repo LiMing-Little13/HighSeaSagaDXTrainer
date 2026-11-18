@@ -1,795 +1,19 @@
 import ctypes
-import json
-import shutil
+import queue
+import re
+import threading
 import tkinter as tk
-from datetime import datetime
-from pathlib import Path
 from tkinter import font as tkfont
-from tkinter import messagebox, ttk
+from tkinter import filedialog, messagebox, ttk
 
-import frida
+from app_settings import (
+    DEFAULT_BACKUP_ROOT, DEFAULT_LOCK_INTERVAL_MS, SettingsStore, validate_backup_root,
+)
 
-GAME_NAME = "KairoGames.exe"
-GAME_SAVES = Path(r"E:\SteamLibrary\steamapps\common\High Sea Saga DX\saves")
-BACKUP_ROOT = Path(__file__).resolve().parent / "backups"
-SETTINGS_FILE = Path(__file__).resolve().parent / "trainer_settings.json"
-PARAM_NAMES = ["HP", "SP", "攻击", "防御", "速度", "智慧"]
-PARAM_SUM_LIMIT = 2_000_000_000
-# 探索/战斗中攻/防/速会再乘"属性相性"(100±affinity)/100，HP/SP/速度会被技能按百分比放大，
-# 两处都是 32 位乘法；合计超过约 1000 万后乘法溢出，会出现打不动怪、防御变负被秒杀、恢复异常等，
-# 直接导致探索失败。智慧只有固定加法，不受此限。
-PARAM_SAFE_TOTAL = 9_990_000
-PARAM_SAFE_LIMITED = ("HP", "SP", "攻击", "防御", "速度")
-PARAM_ONECLICK_BASE = 10_000
-PARAM_ONECLICK_GROWTH = PARAM_SAFE_TOTAL - PARAM_ONECLICK_BASE
-RESOURCE_FIELDS = (("money", "金钱"), ("food", "食物/资源"), ("medals", "奖牌"), ("stamina", "当前体力"))
-
-IL2CPP_SCRIPT = r"""
-const game = Process.getModuleByName('GameAssembly.dll');
-const POINTER = Process.pointerSize;
-function fn(name, ret, args) {
-  return new NativeFunction(game.getExportByName(name), ret, args, 'mscdecl');
-}
-const api = {
-  domainGet: fn('il2cpp_domain_get', 'pointer', []),
-  domainAssemblies: fn('il2cpp_domain_get_assemblies', 'pointer', ['pointer', 'pointer']),
-  assemblyImage: fn('il2cpp_assembly_get_image', 'pointer', ['pointer']),
-  classFromName: fn('il2cpp_class_from_name', 'pointer', ['pointer', 'pointer', 'pointer']),
-  classFields: fn('il2cpp_class_get_fields', 'pointer', ['pointer', 'pointer']),
-  classParent: fn('il2cpp_class_get_parent', 'pointer', ['pointer']),
-  fieldName: fn('il2cpp_field_get_name', 'pointer', ['pointer']),
-  fieldOffset: fn('il2cpp_field_get_offset', 'uint', ['pointer']),
-  fieldStaticGet: fn('il2cpp_field_static_get_value', 'void', ['pointer', 'pointer']),
-  objectClass: fn('il2cpp_object_get_class', 'pointer', ['pointer']),
-  objectNew: fn('il2cpp_object_new', 'pointer', ['pointer']),
-  arrayLength: fn('il2cpp_array_length', 'uint', ['pointer']),
-  threadAttach: fn('il2cpp_thread_attach', 'pointer', ['pointer']),
-  classMethod: fn('il2cpp_class_get_method_from_name', 'pointer', ['pointer', 'pointer', 'int']),
-  runtimeInvoke: fn('il2cpp_runtime_invoke', 'pointer', ['pointer', 'pointer', 'pointer', 'pointer'])
-};
-const domain = api.domainGet();
-api.threadAttach(domain);
-function text(pointer) {
-  return pointer.isNull() ? null : pointer.readUtf8String();
-}
-function findClass(namespace, name) {
-  const size = Memory.alloc(POINTER);
-  const assemblies = api.domainAssemblies(domain, size);
-  const namespacePointer = Memory.allocUtf8String(namespace);
-  const namePointer = Memory.allocUtf8String(name);
-  for (let i = 0; i < size.readU32(); i++) {
-    const image = api.assemblyImage(assemblies.add(i * POINTER).readPointer());
-    const klass = api.classFromName(image, namespacePointer, namePointer);
-    if (!klass.isNull()) return klass;
-  }
-  throw new Error('找不到类：' + namespace + '.' + name);
-}
-function getField(klass, name) {
-  while (!klass.isNull()) {
-    const iterator = Memory.alloc(POINTER);
-    iterator.writePointer(NULL);
-    for (;;) {
-      const field = api.classFields(klass, iterator);
-      if (field.isNull()) break;
-      if (text(api.fieldName(field)) === name) return field;
-    }
-    klass = api.classParent(klass);
-  }
-  throw new Error('找不到字段：' + name);
-}
-function offset(klass, name) {
-  return api.fieldOffset(getField(klass, name));
-}
-const appClass = findClass('main', 'AppData');
-const playerClass = findClass('game', 'Player');
-const crewClass = findClass('game', 'Crew');
-const characterClass = findClass('game', 'Character');
-const humanClass = findClass('game', 'Human');
-const itemDataClass = findClass('data', 'ItemData');
-const equipDataClass = findClass('data', 'EquipData');
-const baseDataClass = findClass('data', 'BaseDataExt');
-const sugorokuItemClass = findClass('data', 'SugorokuItem');
-const sugorokuDataClass = findClass('data', 'SugorokuData');
-const diceClass = findClass('game', 'Dice');
-const subFormClass = findClass('form', 'SubForm');
-const exIntClass = findClass('ext.util', 'ExInt');
-const coinManagerClass = findClass('system.coin.ui', 'CoinManager');
-const coinSetClass = findClass('system.coin.ui', 'CoinSet');
-const secureLongClass = findClass('kairo.unity.util', 'SecureLong');
-const appSingletonField = getField(appClass, 'apdat_');
-const playerFieldOffset = offset(appClass, 'player_');
-const itemListFieldOffset = offset(appClass, 'itemList_');
-const equipListFieldOffset = offset(appClass, 'equipList_');
-const sugorokuItemFieldOffset = offset(appClass, 'sugorokuItem_');
-const moneyFieldOffset = offset(playerClass, 'money_');
-const researchFieldOffset = offset(playerClass, 'researchPoint_');
-const staminaFieldOffset = offset(playerClass, 'stamina_');
-const humansFieldOffset = offset(appClass, 'humans_');
-const diceFieldOffset = offset(playerClass, 'dice_');
-const sugorokuPlayNumFieldOffset = offset(playerClass, 'sugorokuPlayNum_');
-const dicePowFieldOffset = offset(diceClass, 'dicePow_');
-// 双六棋盘实时状态：game.Dice 挂在 Player 上，level_/pos_ 为当前关卡与位置。
-// 实测 level_ 是 0 基索引（内部 level 8 -> sugorokuList_[8]，即玩家所见的第 9 关）。
-const diceLevelFieldOffset = offset(diceClass, 'level_');
-const dicePosFieldOffset = offset(diceClass, 'pos_');
-const sugorokuListFieldOffset = offset(appClass, 'sugorokuList_');
-const sugorokuGuridMaxOffset = offset(sugorokuDataClass, 'guridMax_');
-const sugorokuItemNameOffset = offset(sugorokuItemClass, 'name_');
-const nameOffset = offset(crewClass, 'name_');
-const levelOffset = offset(crewClass, 'lv_');
-const expOffset = offset(crewClass, 'exp_');
-const battleHPOffset = offset(crewClass, 'battleHP_');
-const battleSPOffset = offset(crewClass, 'battleSP_');
-const addParamsOffset = offset(crewClass, 'addParam_');
-const paramsOffset = offset(characterClass, 'param_');
-const itemNameOffset = offset(itemDataClass, 'name_');
-const equipNameOffset = offset(equipDataClass, 'name_');
-const itemIdOffset = offset(baseDataClass, 'id_');
-const kairoPointFieldOffset = offset(playerClass, 'kairoPoint_');
-let stepLockTotal = 0;
-let stepLockDiceCount = 1;
-let stepLockReady = false;
-let stepOverride = null;
-let stepOverrideApplied = false;
-let stepOverridePos = -1;
-let stepOverrideLevel = -1;
-function stepPlan(total, count) {
-  const base = Math.floor(total / count);
-  const extra = total % count;
-  const plan = [];
-  for (let i = 0; i < count; i++) plan.push(base + (i < extra ? 1 : 0));
-  return plan;
-}
-function applyStepValues(array, total, count) {
-  if (array.isNull()) return;
-  const plan = stepPlan(total, count);
-  const length = api.arrayLength(array);
-  for (let i = 0; i < Math.min(length, plan.length); i++) {
-    array.add(16 + i * 4).writeS32(plan[i]);
-  }
-  try {
-    const dice = player().add(diceFieldOffset).readPointer();
-    const powers = dice.isNull() ? NULL : dice.add(dicePowFieldOffset).readPointer();
-    if (!powers.isNull()) {
-      for (let i = 0; i < Math.min(api.arrayLength(powers), plan.length); i++) {
-        powers.add(16 + i * 4).writeS32(plan[i]);
-      }
-    }
-  } catch (e) {}
-}
-function applyStepLock(array) {
-  if (stepLockTotal <= 0 || array.isNull()) return;
-  applyStepValues(array, stepLockTotal, stepLockDiceCount);
-}
-// 目标格模式：设置后每次投掷前读取实时位置，按“目标格 - 当前格”计算步数写入骰子。
-// 超过单掷上限 99 步时保留设置、分多次投掷走过去；到达、越过目标格或切换关卡后自动失效。
-// 实测游戏内显示格数与 pos_ 一致（内部 pos 34 = 游戏显示第 34 格），故 POS_BASE = 0；
-// 若游戏更新后显示差 1，只需同步修改这里与 Python 侧 board_info 的显示换算。
-const POS_BASE = 0;
-let gotoTarget = null;
-let gotoLevel = null;
-let gotoNotice = '';
-function readBoard(currentPlayer) {
-  const dice = (currentPlayer || player()).add(diceFieldOffset).readPointer();
-  if (dice.isNull()) return { ready: false };
-  const level = dice.add(diceLevelFieldOffset).readS32();
-  const pos = dice.add(dicePosFieldOffset).readS32();
-  let gridMax = 0;
-  const list = app().add(sugorokuListFieldOffset).readPointer();
-  if (!list.isNull() && level >= 0 && level < api.arrayLength(list)) {
-    const entry = list.add(16 + level * POINTER).readPointer();
-    if (!entry.isNull()) gridMax = entry.add(sugorokuGuridMaxOffset).readS32();
-  }
-  return { ready: true, level, pos, gridMax };
-}
-function applyGoto(array) {
-  if (array.isNull() || api.arrayLength(array) < 1) return;
-  const board = readBoard();
-  if (!board.ready) return;
-  if (board.level !== gotoLevel) {
-    gotoTarget = null;
-    gotoNotice = '双六关卡已变化，目标格设置已自动失效';
-    send('[修改器] ' + gotoNotice);
-    return;
-  }
-  const steps = gotoTarget - (board.pos + POS_BASE);
-  if (steps <= 0) {
-    gotoTarget = null;
-    gotoNotice = '已到达或越过目标格，目标格设置已自动失效';
-    send('[修改器] ' + gotoNotice);
-    return;
-  }
-  const count = api.arrayLength(array);
-  if (steps < count) {
-    gotoTarget = null;
-    gotoNotice = '与目标格的距离小于本次骰子数量，无法精确到达，目标格设置已自动失效';
-    send('[修改器] ' + gotoNotice);
-    return;
-  }
-  const walk = Math.min(steps, 99);
-  applyStepValues(array, walk, count);
-  // 到达后不在此清除：投掷结算、位置变化后，下一次挂钩会由 steps<=0 判定到达并清除。
-  // 这样即使游戏在一次投掷前后多次调用 CreateDice（冗余触发）也能稳定命中目标格。
-}
-function setGotoCell(target) {
-  if (!stepLockReady) throw new Error('步数锁定挂钩安装失败，请重新连接游戏');
-  const board = readBoard();
-  if (!board.ready) throw new Error('双六对局数据尚未初始化，请进入双六屋后刷新');
-  if (board.gridMax <= 0) throw new Error('无法读取当前关卡的格子数，请进入双六屋后刷新');
-  if (!Number.isInteger(target) || target < 1 || target > board.gridMax) {
-    throw new Error('目标格必须在 1 到 ' + board.gridMax + ' 之间');
-  }
-  const current = board.pos + POS_BASE;
-  if (target <= current) {
-    throw new Error('目标格必须大于当前所在格数（当前第 ' + current + ' 格）');
-  }
-  gotoTarget = target;
-  gotoLevel = board.level;
-  gotoNotice = '';
-  return { target, level: board.level, pos: board.pos, gridMax: board.gridMax };
-}
-function clearGotoCell() {
-  gotoTarget = null;
-  gotoLevel = null;
-  gotoNotice = '';
-  return { cleared: true };
-}
-function readBoardState() {
-  return { board: readBoard(), gotoTarget, gotoNotice, stepOverridePending: stepOverride !== null };
-}
-try {
-  const createDice = api.classMethod(subFormClass, Memory.allocUtf8String('CreateDice'), 1);
-  if (!createDice.isNull() && !createDice.readPointer().isNull()) {
-    Interceptor.attach(createDice.readPointer(), {
-      onEnter(args) {
-        try {
-          if (stepOverride !== null) {
-            // 游戏在一次投掷前后可能多次调用 CreateDice。一次性步数必须一直生效到位置真正变化，
-            // 否则会被冗余调用提前消耗，表现为“隔一次投掷才生效”。
-            let consumed = false;
-            try {
-              if (stepOverrideApplied) {
-                const b = readBoard();
-                consumed = b.ready && (b.pos !== stepOverridePos || b.level !== stepOverrideLevel);
-              }
-            } catch (e) {}
-            if (consumed) {
-              stepOverride = null;
-            } else {
-              if (!args[1].isNull() && api.arrayLength(args[1]) > 0) {
-                applyStepValues(args[1], stepOverride, api.arrayLength(args[1]));
-              }
-              try {
-                const b = readBoard();
-                if (b.ready) {
-                  stepOverrideApplied = true;
-                  stepOverridePos = b.pos;
-                  stepOverrideLevel = b.level;
-                }
-              } catch (e) {}
-              return;
-            }
-          }
-          if (gotoTarget !== null) {
-            applyGoto(args[1]);
-          } else {
-            applyStepLock(args[1]);
-          }
-        } catch (e) {}
-      }
-    });
-    stepLockReady = true;
-  }
-} catch (e) {}
-function setStepLock(total, count) {
-  if (!stepLockReady) throw new Error('步数锁定挂钩安装失败，请重新连接游戏');
-  if (!Number.isInteger(count) || count < 1 || count > 3) throw new Error('骰子数量必须在 1 到 3 之间');
-  if (!Number.isInteger(total) || total < count || total > 99) {
-    throw new Error('总步数必须在 ' + count + ' 到 99 之间');
-  }
-  stepLockTotal = total;
-  stepLockDiceCount = count;
-  return {locked: true, total, diceCount: count};
-}
-function clearStepLock() {
-  stepLockTotal = 0;
-  stepLockDiceCount = 1;
-  return {locked: false};
-}
-function app() {
-  const output = Memory.alloc(POINTER);
-  output.writePointer(NULL);
-  api.fieldStaticGet(appSingletonField, output);
-  const current = output.readPointer();
-  if (current.isNull()) throw new Error('游戏尚未初始化，请稍后刷新');
-  return current;
-}
-function player() {
-  const current = app().add(playerFieldOffset).readPointer();
-  if (current.isNull()) throw new Error('尚未载入存档，请进入正常游戏界面后刷新');
-  return current;
-}
-function invokeInt(klass, object, name) {
-  const method = api.classMethod(klass, Memory.allocUtf8String(name), 0);
-  if (method.isNull()) throw new Error('找不到方法：' + name);
-  const exception = Memory.alloc(POINTER);
-  exception.writePointer(NULL);
-  const result = api.runtimeInvoke(method, object, NULL, exception);
-  if (!exception.readPointer().isNull() || result.isNull()) throw new Error(name + ' 调用失败');
-  return result.add(8).readS32();
-}
-function invokeInt1(klass, object, name, intArg) {
-  const method = api.classMethod(klass, Memory.allocUtf8String(name), 1);
-  if (method.isNull()) throw new Error('找不到方法：' + name);
-  const argMem = Memory.alloc(4);
-  argMem.writeS32(intArg);
-  const args = Memory.alloc(POINTER);
-  args.writePointer(argMem);
-  const exception = Memory.alloc(POINTER);
-  exception.writePointer(NULL);
-  const result = api.runtimeInvoke(method, object, args, exception);
-  if (!exception.readPointer().isNull() || result.isNull()) throw new Error(name + ' 调用失败');
-  return result.add(8).readS32();
-}
-function invokeObject1(klass, object, name, intArg) {
-  const method = api.classMethod(klass, Memory.allocUtf8String(name), 1);
-  if (method.isNull()) throw new Error('找不到方法：' + name);
-  const argMem = Memory.alloc(4);
-  argMem.writeS32(intArg);
-  const args = Memory.alloc(POINTER);
-  args.writePointer(argMem);
-  const exception = Memory.alloc(POINTER);
-  exception.writePointer(NULL);
-  const result = api.runtimeInvoke(method, object, args, exception);
-  if (!exception.readPointer().isNull() || result.isNull()) throw new Error(name + ' 调用失败');
-  return result.add(8).readPointer();
-}
-function invokeVoid0(klass, object, name) {
-  const method = api.classMethod(klass, Memory.allocUtf8String(name), 0);
-  if (method.isNull()) throw new Error('找不到方法：' + name);
-  const exception = Memory.alloc(POINTER);
-  exception.writePointer(NULL);
-  api.runtimeInvoke(method, object, NULL, exception);
-  if (!exception.readPointer().isNull()) throw new Error(name + ' 调用失败');
-}
-function setItemNum(item, value) {
-  const method = api.classMethod(baseDataClass, Memory.allocUtf8String('SetNum'), 1);
-  if (method.isNull()) throw new Error('找不到物品数量写入方法');
-  const valuePointer = Memory.alloc(4);
-  valuePointer.writeS32(value);
-  const args = Memory.alloc(POINTER);
-  args.writePointer(valuePointer);
-  const exception = Memory.alloc(POINTER);
-  exception.writePointer(NULL);
-  api.runtimeInvoke(method, item, args, exception);
-  if (!exception.readPointer().isNull()) throw new Error('物品数量写入失败');
-  if (invokeInt(baseDataClass, item, 'GetNum') !== value) throw new Error('物品数量写入后校验失败');
-}
-function setExInt(object, value) {
-  const method = api.classMethod(exIntClass, Memory.allocUtf8String('Set'), 1);
-  if (method.isNull()) throw new Error('找不到数值写入方法');
-  const valuePointer = Memory.alloc(4);
-  valuePointer.writeS32(value);
-  const args = Memory.alloc(POINTER);
-  args.writePointer(valuePointer);
-  const exception = Memory.alloc(POINTER);
-  exception.writePointer(NULL);
-  api.runtimeInvoke(method, object, args, exception);
-  if (!exception.readPointer().isNull()) throw new Error('数值写入失败');
-  if (invokeInt(exIntClass, object, 'Get') !== value) throw new Error('数值写入后校验失败');
-}
-function exIntAt(object, fieldOffset, label) {
-  const wrapper = object.add(fieldOffset).readPointer();
-  if (wrapper.isNull()) throw new Error(label + '尚未初始化');
-  return wrapper;
-}
-function readExInt(object, fieldOffset, label) {
-  return invokeInt(exIntClass, exIntAt(object, fieldOffset, label), 'Get');
-}
-function writeInt(object, fieldOffset, value) {
-  object.add(fieldOffset).writeS32(value);
-  if (object.add(fieldOffset).readS32() !== value) throw new Error('整数写入后校验失败');
-}
-function staticInt(klass, name) {
-  const output = Memory.alloc(4);
-  api.fieldStaticGet(getField(klass, name), output);
-  return output.readS32();
-}
-function managedString(object) {
-  if (object.isNull()) return '';
-  return object.add(12).readUtf16String(object.add(8).readS32());
-}
-function intArray(object, fieldOffset) {
-  const array = object.add(fieldOffset).readPointer();
-  if (array.isNull()) throw new Error('属性数组为空');
-  const length = api.arrayLength(array);
-  if (length < 6) throw new Error('属性数组长度异常：' + length);
-  const values = [];
-  for (let i = 0; i < 6; i++) values.push(array.add(16 + i * 4).readS32());
-  return values;
-}
-function collection(object) {
-  if (object.isNull()) return [];
-  let klass = api.objectClass(object);
-  const iterator = Memory.alloc(POINTER);
-  iterator.writePointer(NULL);
-  let listField = NULL;
-  let itemsField = NULL;
-  let sizeField = NULL;
-  let currentClass = klass;
-  while (!currentClass.isNull()) {
-    const fields = Memory.alloc(POINTER);
-    fields.writePointer(NULL);
-    for (;;) {
-      const field = api.classFields(currentClass, fields);
-      if (field.isNull()) break;
-      const name = text(api.fieldName(field));
-      if (name === 'list_') listField = field;
-      if (name === '_items') itemsField = field;
-      if (name === '_size') sizeField = field;
-    }
-    currentClass = api.classParent(currentClass);
-  }
-  if (!listField.isNull()) return collection(object.add(api.fieldOffset(listField)).readPointer());
-  if (itemsField.isNull() || sizeField.isNull()) throw new Error('不支持的集合布局');
-  const items = object.add(api.fieldOffset(itemsField)).readPointer();
-  const count = object.add(api.fieldOffset(sizeField)).readS32();
-  if (count < 0 || count > 10000) throw new Error('集合数量异常：' + count);
-  const result = [];
-  for (let i = 0; i < count; i++) result.push(items.add(16 + i * POINTER).readPointer());
-  return result;
-}
-function crewObjects(currentPlayer) {
-  const result = [];
-  const seen = new Set();
-  const groups = app().add(humansFieldOffset).readPointer();
-  if (groups.isNull()) throw new Error('同伴名单尚未初始化');
-  for (let i = 0; i < api.arrayLength(groups); i++) {
-    for (const entry of collection(groups.add(16 + i * POINTER).readPointer())) {
-      if (entry.isNull()) continue;
-      const klass = api.objectClass(entry).toString();
-      let crew = entry;
-      if (klass === humanClass.toString()) {
-        crew = entry.add(offset(humanClass, 'crew_')).readPointer();
-      } else if (klass !== characterClass.toString() && klass !== crewClass.toString()) {
-        continue;
-      }
-      if (crew.isNull() || seen.has(crew.toString())) continue;
-      seen.add(crew.toString());
-      result.push(crew);
-    }
-  }
-  return result;
-}
-function readCrew(crew, index) {
-  return {
-    index,
-    name: managedString(crew.add(nameOffset).readPointer()),
-    level: crew.add(levelOffset).readS32(),
-    exp: crew.add(expOffset).readS32(),
-    battleHP: crew.add(battleHPOffset).readS32(),
-    battleSP: crew.add(battleSPOffset).readS32(),
-    params: intArray(crew, paramsOffset),
-    addParams: intArray(crew, addParamsOffset)
-  };
-}
-function secure(wrapper) {
-  const value = wrapper.add(offset(api.objectClass(wrapper), 'value_')).readPointer();
-  if (value.isNull()) throw new Error('数值封装对象为空');
-  const klass = api.objectClass(value);
-  return {
-    object: value,
-    originalOffset: offset(klass, 'original_'),
-    valueOffset: offset(klass, 'value_'),
-    bitmaskOffset: offset(klass, 'bitmask_')
-  };
-}
-function readSecure(wrapper) {
-  const secureValue = secure(wrapper);
-  return secureValue.object.add(secureValue.originalOffset).readS64().toNumber();
-}
-function writeSecure(wrapper, value) {
-  const secureValue = secure(wrapper);
-  const bitmask = secureValue.object.add(secureValue.bitmaskOffset).readS64();
-  secureValue.object.add(secureValue.originalOffset).writeS64(new Int64(value));
-  secureValue.object.add(secureValue.valueOffset).writeS64(bitmask.xor(new Int64(value)));
-  if (readSecure(wrapper) !== value) throw new Error('封装数值写入后校验失败');
-}
-function researchWrapper(currentPlayer, index) {
-  const array = currentPlayer.add(researchFieldOffset).readPointer();
-  if (array.isNull() || api.arrayLength(array) <= index) throw new Error('研究点数组异常');
-  return array.add(16 + index * POINTER).readPointer();
-}
-function staminaWrapper(currentPlayer, index) {
-  const array = currentPlayer.add(staminaFieldOffset).readPointer();
-  if (array.isNull() || api.arrayLength(array) <= index) throw new Error('体力数组异常');
-  return array.add(16 + index * POINTER).readPointer();
-}
-function coinManager() {
-  const method = api.classMethod(coinManagerClass, Memory.allocUtf8String('GetInstance'), 0);
-  const exception = Memory.alloc(POINTER);
-  exception.writePointer(NULL);
-  const manager = api.runtimeInvoke(method, NULL, NULL, exception);
-  if (!exception.readPointer().isNull() || manager.isNull()) throw new Error('奖牌管理器尚未初始化');
-  return manager;
-}
-function coinNumbers() {
-  const manager = coinManager();
-  const listOffset = offset(coinManagerClass, 'conList_');
-  const numOffset = offset(coinSetClass, 'Num');
-  const expirationOffset = offset(coinSetClass, 'Expiration');
-  const result = [];
-  for (const coinSet of collection(manager.add(listOffset).readPointer())) {
-    if (coinSet.add(expirationOffset).readU8() === 0) {
-      result.push(coinSet.add(numOffset).readPointer());
-    }
-  }
-  if (!result.length) throw new Error('当前没有可修改的奖牌计数');
-  return result;
-}
-function readCoinNumber(number) {
-  return number.add(offset(secureLongClass, 'original_')).readS64().toNumber();
-}
-function writeCoinNumber(number, value) {
-  const bitmask = number.add(offset(secureLongClass, 'bitmask_')).readS64();
-  number.add(offset(secureLongClass, 'original_')).writeS64(new Int64(value));
-  number.add(offset(secureLongClass, 'value_')).writeS64(bitmask.xor(new Int64(value)));
-  if (readCoinNumber(number) !== value) throw new Error('奖牌写入后校验失败');
-}
-function readMedals() {
-  return coinNumbers().reduce((total, number) => total + readCoinNumber(number), 0);
-}
-function writeMedals(value) {
-  const numbers = coinNumbers();
-  const newFirstValue = readCoinNumber(numbers[0]) + value - readMedals();
-  if (newFirstValue < 0) throw new Error('目标奖牌数低于其它奖牌明细之和，无法安全应用');
-  writeCoinNumber(numbers[0], newFirstValue);
-  if (readMedals() !== value) throw new Error('奖牌总数写入后校验失败');
-}
-function itemArrayByTab(tab) {
-  const array = app().add(tab === 0 ? equipListFieldOffset : itemListFieldOffset).readPointer();
-  if (array.isNull()) throw new Error(tab === 0 ? '武器列表尚未初始化' : '物品列表尚未初始化');
-  return array;
-}
-// 游戏道具分页：0=武器（装备） 1=道具 2=强化（强化用食物）。
-// 直接复用游戏自身的 SubForm.GetItemList(tab) 枚举，保证与游戏内分页一致。
-function readItemsByTab(tab) {
-  const form = api.objectNew(subFormClass);
-  if (form.isNull()) throw new Error('无法创建游戏窗口对象');
-  invokeVoid0(subFormClass, form, '.ctor');
-  const rows = collection(invokeObject1(subFormClass, form, 'GetItemList', tab));
-  const result = [];
-  for (const row of rows) {
-    if (row.isNull() || api.arrayLength(row) < 2) continue;
-    const item = row.add(16 + POINTER).readPointer();
-    if (item.isNull()) continue;
-    const count = invokeInt(baseDataClass, item, 'GetNum');
-    if (count <= 0) continue;
-    const isEquip = api.objectClass(item).toString() === equipDataClass.toString();
-    result.push({
-      id: item.add(itemIdOffset).readS32(),
-      name: managedString(item.add(isEquip ? equipNameOffset : itemNameOffset).readPointer()),
-      count,
-      maximum: invokeInt(isEquip ? equipDataClass : itemDataClass, item, 'GetMaxNum')
-    });
-  }
-  return result;
-}
-function readSugorokuCards() {
-  const cards = [];
-  const cardArray = app().add(sugorokuItemFieldOffset).readPointer();
-  if (cardArray.isNull()) return {cards, ready: false};
-  for (let i = 0; i < api.arrayLength(cardArray); i++) {
-    const card = cardArray.add(16 + i * POINTER).readPointer();
-    if (card.isNull()) continue;
-    cards.push({
-      index: i,
-      name: managedString(card.add(sugorokuItemNameOffset).readPointer()),
-      count: invokeInt(baseDataClass, card, 'GetNum'),
-      maximum: invokeInt(sugorokuItemClass, card, 'GetMaxNum')
-    });
-  }
-  return {cards, ready: true};
-}
-function readSugoroku(currentPlayer) {
-  const cardInfo = readSugorokuCards();
-  const dice = currentPlayer.add(diceFieldOffset).readPointer();
-  const dicePow = dice.isNull() ? NULL : dice.add(dicePowFieldOffset).readPointer();
-  const powers = [];
-  let diceReady = false;
-  if (!dicePow.isNull() && api.arrayLength(dicePow) >= 1) {
-    diceReady = true;
-    for (let i = 0; i < api.arrayLength(dicePow); i++) powers.push(dicePow.add(16 + i * 4).readS32());
-  }
-  const playNum = exIntAt(currentPlayer, sugorokuPlayNumFieldOffset, '双六次数');
-  const kairoWrapper = currentPlayer.add(kairoPointFieldOffset).readPointer();
-  let board = { ready: false };
-  try {
-    board = readBoard(currentPlayer);
-  } catch (e) {}
-  return {
-    cards: cardInfo.cards,
-    cardsReady: cardInfo.ready,
-    step: diceReady ? powers[0] : 0,
-    powers,
-    diceReady,
-    stepLocked: stepLockTotal > 0,
-    stepLockTotal,
-    stepLockDiceCount,
-    board,
-    remaining: invokeInt(exIntClass, playNum, 'Get'),
-    maximum: staticInt(playerClass, 'SUGOROKU_PLAY_NUM'),
-    kairoPoint: kairoWrapper.isNull() ? 0 : invokeInt(exIntClass, kairoWrapper, 'Get'),
-    kairoReady: !kairoWrapper.isNull()
-  };
-}
-function readState() {
-  const currentPlayer = player();
-  return {
-    money: readSecure(currentPlayer.add(moneyFieldOffset).readPointer()),
-    food: readSecure(researchWrapper(currentPlayer, 0)),
-    medals: readMedals(),
-    stamina: readSecure(staminaWrapper(currentPlayer, 2)),
-    crews: crewObjects(currentPlayer).map(readCrew),
-    itemsByTab: [readItemsByTab(0), readItemsByTab(1), readItemsByTab(2)],
-    sugoroku: readSugoroku(currentPlayer)
-  };
-}
-function writeIntArray(object, fieldOffset, values) {
-  const array = object.add(fieldOffset).readPointer();
-  if (array.isNull() || api.arrayLength(array) < 6) throw new Error('属性数组异常');
-  for (let i = 0; i < 6; i++) {
-    array.add(16 + i * 4).writeS32(values[i]);
-    if (array.add(16 + i * 4).readS32() !== values[i]) throw new Error('属性写入后校验失败');
-  }
-}
-function applyChanges(changes) {
-  const currentPlayer = player();
-  const crews = crewObjects(currentPlayer);
-  const PARAM_NAME_TABLE = ['HP', 'SP', '攻击', '防御', '速度', '智慧'];
-  const PARAM_SAFE_TOTAL = 9990000;
-  const PARAM_SAFE_LIMITED = ['HP', 'SP', '攻击', '防御', '速度'];
-  for (const change of changes.crews) {
-    if (change.index < 0 || change.index >= crews.length) throw new Error('船员列表已变化，请刷新后重试');
-    for (let i = 0; i < 6; i++) {
-      const sum = change.params[i] + change.addParams[i];
-      const limit = PARAM_SAFE_LIMITED.includes(PARAM_NAME_TABLE[i]) ? PARAM_SAFE_TOTAL : 2000000000;
-      if (sum > limit) {
-        throw new Error(PARAM_NAME_TABLE[i] + ' 的基础 ' + change.params[i] + ' 与成长 ' + change.addParams[i] +
-          ' 合计 ' + sum + ' 超过 ' + limit +
-          (limit === PARAM_SAFE_TOTAL
-            ? '；该项在探索/战斗计算中含 32 位乘法（属性相性或技能百分比），超出后会导致打不动怪、被秒杀或恢复异常'
-            : '；游戏按 32 位整数求和，溢出后该属性会归为 1') +
-          '，请调低后再应用');
-      }
-    }
-  }
-  writeSecure(currentPlayer.add(moneyFieldOffset).readPointer(), changes.money);
-  writeSecure(researchWrapper(currentPlayer, 0), changes.food);
-  writeMedals(changes.medals);
-  writeSecure(staminaWrapper(currentPlayer, 2), changes.stamina);
-  for (const change of changes.crews) {
-    const crew = crews[change.index];
-    writeInt(crew, levelOffset, change.level);
-    writeInt(crew, expOffset, change.exp);
-    writeIntArray(crew, paramsOffset, change.params);
-    writeIntArray(crew, addParamsOffset, change.addParams);
-    let battleHP = change.battleHP;
-    let battleSP = change.battleSP;
-    if (change.restoreBattle) {
-      battleHP = invokeInt1(characterClass, crew, 'GetParam', 0);
-      battleSP = invokeInt1(characterClass, crew, 'GetParam', 1);
-    }
-    writeInt(crew, battleHPOffset, battleHP);
-    writeInt(crew, battleSPOffset, battleSP);
-  }
-  return readState();
-}
-function applyItemTabChanges(changes) {
-  const array = itemArrayByTab(changes.tab);
-  const length = api.arrayLength(array);
-  const wanted = new Set(changes.ids);
-  const plans = [];
-  for (let i = 0; i < length; i++) {
-    const item = array.add(16 + i * POINTER).readPointer();
-    if (item.isNull() || !wanted.has(item.add(itemIdOffset).readS32())) continue;
-    if (invokeInt(baseDataClass, item, 'GetNum') <= 0) throw new Error('物品已不再持有，请刷新后重试');
-    const isEquip = api.objectClass(item).toString() === equipDataClass.toString();
-    const maximum = invokeInt(isEquip ? equipDataClass : itemDataClass, item, 'GetMaxNum');
-    const value = changes.safeMax ? Math.max(0, maximum - 9) : changes.value;
-    if (!Number.isInteger(value) || value < 0 || value > maximum) {
-      throw new Error('物品数量必须在 0 到当前上限 ' + maximum + ' 之间');
-    }
-    plans.push({item, value});
-  }
-  if (plans.length !== wanted.size) throw new Error('物品列表已变化，请刷新后重试');
-  for (const plan of plans) setItemNum(plan.item, plan.value);
-  return readState();
-}
-function applySugorokuChanges(changes) {
-  if (Array.isArray(changes.cards) && changes.cards.length) {
-    const array = app().add(sugorokuItemFieldOffset).readPointer();
-    if (array.isNull()) throw new Error('双六卡片列表尚未初始化，请进入双六屋后刷新');
-    const length = api.arrayLength(array);
-    const plans = [];
-    for (const index of new Set(changes.cards)) {
-      if (!Number.isInteger(index) || index < 0 || index >= length) throw new Error('双六卡片列表已变化，请刷新后重试');
-      const card = array.add(16 + index * POINTER).readPointer();
-      if (card.isNull()) throw new Error('双六卡片不存在，请刷新后重试');
-      const maximum = invokeInt(sugorokuItemClass, card, 'GetMaxNum');
-      const value = changes.safeMax ? (maximum > 1 ? maximum - 1 : maximum) : changes.cardValue;
-      if (!Number.isInteger(value) || value < 0 || value > maximum) {
-        throw new Error('卡片数量必须在 0 到当前上限 ' + maximum + ' 之间');
-      }
-      plans.push({card, value});
-    }
-    for (const plan of plans) setItemNum(plan.card, plan.value);
-  }
-  const currentPlayer = player();
-  if (changes.step !== undefined) {
-    const diceCount = changes.diceCount === undefined ? 1 : changes.diceCount;
-    if (!Number.isInteger(diceCount) || diceCount < 1 || diceCount > 3) throw new Error('骰子数量必须在 1 到 3 之间');
-    if (!Number.isInteger(changes.step) || changes.step < diceCount || changes.step > 99) {
-      throw new Error('总步数必须在 ' + diceCount + ' 到 99 之间');
-    }
-    const dice = currentPlayer.add(diceFieldOffset).readPointer();
-    const dicePow = dice.isNull() ? NULL : dice.add(dicePowFieldOffset).readPointer();
-    if (dicePow.isNull() || api.arrayLength(dicePow) < diceCount) throw new Error('骰子数据尚未初始化');
-    const base = Math.floor(changes.step / diceCount);
-    const extra = changes.step % diceCount;
-    for (let i = 0; i < diceCount; i++) writeInt(dicePow, 16 + i * 4, base + (i < extra ? 1 : 0));
-    stepOverride = changes.step;
-    stepOverrideApplied = false;
-    stepOverridePos = -1;
-    stepOverrideLevel = -1;
-  }
-  if (changes.remaining !== undefined) {
-    const maximum = staticInt(playerClass, 'SUGOROKU_PLAY_NUM');
-    if (!Number.isInteger(changes.remaining) || changes.remaining < 0 || changes.remaining > maximum) {
-      throw new Error('剩余投掷次数必须在 0 到 ' + maximum + ' 之间');
-    }
-    const playNum = currentPlayer.add(sugorokuPlayNumFieldOffset).readPointer();
-    if (playNum.isNull()) throw new Error('双六次数尚未初始化');
-    setExInt(playNum, changes.remaining);
-  }
-  if (changes.kairoPoint !== undefined) {
-    if (!Number.isInteger(changes.kairoPoint) || changes.kairoPoint < 0 || changes.kairoPoint > 2147483647) {
-      throw new Error('开罗点数必须在 0 到 2147483647 之间');
-    }
-    setExInt(exIntAt(currentPlayer, kairoPointFieldOffset, '开罗点数'), changes.kairoPoint);
-  }
-  return readState();
-}
-function readSugorokuRemaining() {
-  const currentPlayer = player();
-  return {
-    remaining: readExInt(currentPlayer, sugorokuPlayNumFieldOffset, '双六次数'),
-    maximum: staticInt(playerClass, 'SUGOROKU_PLAY_NUM')
-  };
-}
-function writeSugorokuRemaining(value) {
-  const maximum = staticInt(playerClass, 'SUGOROKU_PLAY_NUM');
-  if (!Number.isInteger(value) || value < 0 || value > maximum) {
-    throw new Error('剩余投掷次数必须在 0 到 ' + maximum + ' 之间');
-  }
-  const wrapper = exIntAt(player(), sugorokuPlayNumFieldOffset, '双六次数');
-  setExInt(wrapper, value);
-  return {remaining: invokeInt(exIntClass, wrapper, 'Get'), maximum};
-}
-rpc.exports = {
-  readState,
-  applyChanges,
-  applyItemTabChanges,
-  applySugorokuChanges,
-  readSugorokuRemaining,
-  writeSugorokuRemaining,
-  setStepLock,
-  clearStepLock,
-  setGotoCell,
-  clearGotoCell,
-  readBoardState
-};
-"""
+from game_backend import (
+    IL2CPPGame, GAME_NAME, PARAM_NAMES, PARAM_SUM_LIMIT, PARAM_SAFE_TOTAL,
+    PARAM_SAFE_LIMITED, PARAM_ONECLICK_BASE, PARAM_ONECLICK_GROWTH, RESOURCE_FIELDS,
+)
 
 
 class Tooltip:
@@ -829,140 +53,88 @@ class Tooltip:
             self.window = None
 
 
-class IL2CPPGame:
-    def __init__(self):
-        self.session = None
-        self.script = None
-        self.pid = None
-        self.backup_created = False
+class GameWorker:
+    def __init__(self, backup_root):
+        self.jobs = queue.Queue()
+        self.results = queue.Queue()
+        self.backup_root = backup_root
+        self.thread = threading.Thread(target=self._run, name="game-worker", daemon=True)
+        self.thread.start()
 
-    def connect(self):
-        self.close()
-        device = frida.get_local_device()
-        process = next((p for p in device.enumerate_processes() if p.name.lower() == GAME_NAME.lower()), None)
-        if process is None:
-            raise RuntimeError("未找到 KairoGames.exe，请先启动游戏并载入存档")
-        self.session = device.attach(process.pid)
-        try:
-            self.script = self.session.create_script(IL2CPP_SCRIPT)
-            self.script.load()
-            self.pid = process.pid
-        except Exception:
-            self.close()
-            raise
-
-    def read_state(self):
-        if self.script is None:
-            raise RuntimeError("请先连接游戏")
-        return self.script.exports_sync.read_state()
-
-    def apply_changes(self, changes):
-        if self.script is None:
-            raise RuntimeError("请先连接游戏")
-        if not self.backup_created:
-            self.backup_saves()
-        result = self.script.exports_sync.apply_changes(changes)
-        self.backup_created = True
-        return result
-
-    def apply_tab_items(self, tab, ids, value=None, safe_max=False):
-        if self.script is None:
-            raise RuntimeError("请先连接游戏")
-        if not self.backup_created:
-            self.backup_saves()
-        result = self.script.exports_sync.apply_item_tab_changes({
-            "tab": tab,
-            "ids": ids,
-            "value": value,
-            "safeMax": safe_max,
-        })
-        self.backup_created = True
-        return result
-
-    def apply_sugoroku(self, changes):
-        if self.script is None:
-            raise RuntimeError("请先连接游戏")
-        if not self.backup_created:
-            self.backup_saves()
-            self.backup_created = True
-        return self.script.exports_sync.apply_sugoroku_changes(changes)
-
-    def apply_cards(self, indices, value=None, safe_max=False):
-        if self.script is None:
-            raise RuntimeError("请先连接游戏")
-        if not self.backup_created:
-            self.backup_saves()
-            self.backup_created = True
-        return self.script.exports_sync.apply_sugoroku_changes({
-            "cards": indices,
-            "cardValue": value,
-            "safeMax": safe_max,
-        })
-
-    def read_sugoroku_remaining(self):
-        if self.script is None:
-            raise RuntimeError("请先连接游戏")
-        return self.script.exports_sync.read_sugoroku_remaining()
-
-    def write_sugoroku_remaining(self, value):
-        if self.script is None:
-            raise RuntimeError("请先连接游戏")
-        if not self.backup_created:
-            self.backup_saves()
-            self.backup_created = True
-        return self.script.exports_sync.write_sugoroku_remaining(value)
-
-    def set_step_lock(self, total, count):
-        if self.script is None:
-            raise RuntimeError("请先连接游戏")
-        return self.script.exports_sync.set_step_lock(total, count)
-
-    def clear_step_lock(self):
-        if self.script is None:
-            raise RuntimeError("请先连接游戏")
-        return self.script.exports_sync.clear_step_lock()
-
-    def set_goto_cell(self, target):
-        if self.script is None:
-            raise RuntimeError("请先连接游戏")
-        return self.script.exports_sync.set_goto_cell(target)
-
-    def clear_goto_cell(self):
-        if self.script is None:
-            raise RuntimeError("请先连接游戏")
-        return self.script.exports_sync.clear_goto_cell()
-
-    def read_board(self):
-        if self.script is None:
-            raise RuntimeError("请先连接游戏")
-        return self.script.exports_sync.read_board_state()
-
-    def ensure_backup(self):
-        if not self.backup_created:
-            self.backup_saves()
-            self.backup_created = True
-
-    def backup_saves(self):
-        if not GAME_SAVES.is_dir():
-            raise RuntimeError(f"找不到存档目录：{GAME_SAVES}")
-        destination = BACKUP_ROOT / datetime.now().strftime("%Y%m%d-%H%M%S-%f") / "saves"
-        destination.parent.mkdir(parents=True, exist_ok=False)
-        shutil.copytree(GAME_SAVES, destination)
-
-    def close(self):
-        if self.script is not None:
+    def _run(self):
+        game = None
+        while True:
             try:
-                self.script.unload()
-            except Exception:
-                pass
-        if self.session is not None:
+                job = self.jobs.get(timeout=0.1)
+            except queue.Empty:
+                job = ()
+            if job is None:
+                lock_error = None
+                if game is not None:
+                    try:
+                        game.clear_step_lock()
+                    except Exception as exc:
+                        lock_error = str(exc)
+                try:
+                    if game is not None:
+                        game.close()
+                except Exception as exc:
+                    message = str(exc)
+                    if lock_error:
+                        message += f"\n步数锁定清理也失败：{lock_error}"
+                    self.results.put(("close_error", message))
+                    continue
+                self.results.put(("closed", None))
+                return
+            if job:
+                token, operation = job
+                try:
+                    if game is None:
+                        game = IL2CPPGame(backup_root=self.backup_root)
+                    result = operation(game)
+                except Exception as exc:
+                    self.results.put(("result", (token, None, exc)))
+                else:
+                    self.results.put(("result", (token, result, None)))
+            if game is None:
+                continue
             try:
-                self.session.detach()
-            except Exception:
-                pass
-        self.script = None
-        self.session = None
-        self.pid = None
+                for event in game.drain_events():
+                    self.results.put(("event", event))
+            except Exception as exc:
+                self.results.put(("event", {"type": "error", "message": str(exc)}))
+
+
+class ScrollPage(ttk.Frame):
+    def __init__(self, parent, padding=10):
+        super().__init__(parent)
+        self.columnconfigure(0, weight=1)
+        self.rowconfigure(0, weight=1)
+        self.canvas = tk.Canvas(self, highlightthickness=0, background="#f5f6f8")
+        self.canvas.grid(row=0, column=0, sticky="nsew")
+        scrollbar = ttk.Scrollbar(self, orient="vertical", command=self.canvas.yview)
+        scrollbar.grid(row=0, column=1, sticky="ns")
+        self.canvas.configure(yscrollcommand=scrollbar.set)
+        self.content = ttk.Frame(self.canvas, padding=padding)
+        self.window = self.canvas.create_window((0, 0), window=self.content, anchor="nw")
+        self.content.bind("<Configure>", self._content_size)
+        self.canvas.bind("<Configure>", self._canvas_size)
+
+    def _content_size(self, _event=None):
+        height = max(self.content.winfo_reqheight(), self.canvas.winfo_height())
+        self.canvas.itemconfigure(self.window, height=height)
+        self.canvas.configure(scrollregion=self.canvas.bbox("all"))
+
+    def _canvas_size(self, event):
+        self.canvas.itemconfigure(self.window, width=event.width)
+        self._content_size()
+
+    def wheel(self, event):
+        if self.content.winfo_reqheight() <= self.canvas.winfo_height():
+            return None
+        delta = -int(event.delta / 120) if event.delta else (1 if event.num == 5 else -1)
+        self.canvas.yview_scroll(delta, "units")
+        return "break"
 
 
 class TrainerApp(tk.Tk):
@@ -978,8 +150,22 @@ class TrainerApp(tk.Tk):
         dpi_scale = self.winfo_fpixels("1i") / 96
         self.title("High Sea Saga DX 直接属性修改器")
         self.geometry(f"{round(760 * dpi_scale)}x{round(680 * dpi_scale)}")
-        self.minsize(round(640 * dpi_scale), round(600 * dpi_scale))
-        self.game = IL2CPPGame()
+        self.minsize(640, 480)
+        self.settings_store = SettingsStore()
+        self._settings_error = None
+        self.settings = self.load_settings()
+        self._closing = False
+        self._close_failed = False
+        self._busy = None
+        self._job_serial = 0
+        self._callbacks = {}
+        self._connected = False
+        self._geometry_timer_id = None
+        self._geometry_enable_timer_id = None
+        self._auto_connect_timer_id = None
+        self._normal_geometry = f"{round(760 * dpi_scale)}x{round(680 * dpi_scale)}+0+0"
+        self._scroll_pages = []
+        self.worker = GameWorker(self.settings.get("backup_root", str(DEFAULT_BACKUP_ROOT)))
         self.state = None
         self.selected_crew = 0
         self.process_var = tk.StringVar(value="未连接")
@@ -1020,12 +206,214 @@ class TrainerApp(tk.Tk):
         self._lock_target_value = 0
         self._lock_failures = 0
         self._column_save_timer_id = None
-        self.settings = self.load_settings()
+        self.backup_root_var = tk.StringVar(value=self.settings.get("backup_root", str(DEFAULT_BACKUP_ROOT)))
+        self.backup_hint_var = tk.StringVar(value=f"存档备份目录：{self.backup_root_var.get()}")
+        self.lock_interval_var = tk.StringVar(value=f"{self.settings.get('lock_interval_ms', DEFAULT_LOCK_INTERVAL_MS) / 1000:g}")
+        self.auto_connect_var = tk.BooleanVar(value=self.settings.get("auto_connect", True))
         self.tooltips = []
         self._setup_style()
         self._build_ui()
+        self._restore_window()
+        self.bind("<Configure>", self._window_changed, add="+")
+        self.bind_all("<MouseWheel>", self._route_wheel, add="+")
+        self.bind_all("<Button-4>", self._route_wheel, add="+")
+        self.bind_all("<Button-5>", self._route_wheel, add="+")
         self.protocol("WM_DELETE_WINDOW", self.on_close)
-        self.after(100, self.connect)
+        self.after(50, self._poll_worker)
+        if self._settings_error:
+            self.status_var.set(f"设置读取失败，使用默认值：{self._settings_error}")
+        elif self.auto_connect_var.get():
+            self._auto_connect_timer_id = self.after(100, self.connect)
+        else:
+            self.status_var.set("请启动游戏并载入存档后连接")
+
+    def _submit(self, title, operation, success=None, failure=None, quiet=False, require_connection=True):
+        if self._closing or self._close_failed:
+            return False
+        if self._busy is not None:
+            if not quiet:
+                self.status_var.set(f"正在{self._busy}，请等待完成")
+            return False
+        if require_connection and not self._connected:
+            if not quiet:
+                self.status_var.set("请先连接游戏")
+            return False
+        self._job_serial += 1
+        self._busy = title
+        self._callbacks[self._job_serial] = (title, success, failure, quiet)
+        self.worker.jobs.put((self._job_serial, operation))
+        self._set_controls_busy(True)
+        if not quiet:
+            self.status_var.set(f"正在{title}……")
+        return True
+
+    def _set_controls_busy(self, busy):
+        def visit(widget):
+            if isinstance(widget, (ttk.Button, ttk.Checkbutton, ttk.Combobox, ttk.Entry, ttk.Spinbox)):
+                if busy:
+                    widget.state(["disabled"])
+                else:
+                    widget.state(["!disabled"])
+            for child in widget.winfo_children():
+                visit(child)
+        visit(self.notebook)
+
+    def _poll_worker(self):
+        while True:
+            try:
+                kind, payload = self.worker.results.get_nowait()
+            except queue.Empty:
+                break
+            if kind == "closed":
+                self.destroy()
+                return
+            if kind == "close_error":
+                self._close_failed = True
+                self._closing = False
+                self._stop_lock_remaining()
+                self.lock_remaining_var.set(False)
+                self._set_controls_busy(True)
+                self.status_var.set("关闭失败：后端引用已保留，已停止次数锁定；请再次关闭窗口以重试")
+                messagebox.showerror("关闭失败", f"{payload}\n\n尚未确认释放游戏连接，已阻止新连接和写入。\n请再次关闭窗口以重试。", parent=self)
+                continue
+            if kind == "event":
+                if self._closing or self._close_failed:
+                    continue
+                if payload.get("type") == "detached":
+                    self._reset_connection()
+                    self.status_var.set(f"游戏连接已断开：{payload.get('message', '')}")
+                elif payload.get("type") in ("error", "message"):
+                    self.status_var.set(payload.get("message", ""))
+                continue
+            token, value, error = payload
+            title, success, failure, quiet = self._callbacks.pop(token)
+            self._busy = None
+            if self._closing:
+                continue
+            self._set_controls_busy(False)
+            if error is not None:
+                if failure:
+                    failure(error)
+                if not quiet:
+                    self.status_var.set(f"{title}失败")
+                    messagebox.showerror(f"{title}失败", str(error), parent=self)
+            elif success:
+                success(value)
+        self.after(50, self._poll_worker)
+
+    def _reset_connection(self):
+        self._connected = False
+        self._stop_lock_remaining()
+        self.lock_remaining_var.set(False)
+        self.lock_step_var.set(False)
+        self._lock_target_value = 0
+        self.state = None
+        self.process_var.set("未连接")
+        self.summary_var.set("尚未读取数据")
+        for var in self.resource_vars.values():
+            var.set("")
+        for var in list(self.crew_vars.values()) + self.param_vars + self.add_param_vars:
+            var.set("")
+        self.crew_selector.configure(values=())
+        self.crew_choice_var.set("")
+        for info in self.item_tabs.values():
+            info["checked"].clear()
+            info["tree"].delete(*info["tree"].get_children())
+            info["value_var"].set("")
+            info["limit_var"].set("请先连接游戏")
+        self.checked_cards.clear()
+        self.card_tree.delete(*self.card_tree.get_children())
+        self.card_value_var.set("")
+        self.card_limit_var.set("请先连接游戏")
+        self.dice_remaining_var.set("")
+        self.dice_step_var.set("")
+        self.kairo_point_var.set("")
+        self.board_info_var.set("尚未读取棋盘状态，请刷新")
+        self.goto_status_var.set("尚未设置目标格")
+
+    def disconnect(self):
+        if self._busy is not None or self._closing:
+            return
+        self._stop_lock_remaining()
+        self._submit("断开游戏", lambda game: game.close(), lambda _value: self._disconnected(), require_connection=False)
+
+    def _disconnected(self):
+        self._reset_connection()
+        self.status_var.set("已断开游戏")
+
+    def _write(self, title, operation, scope, message, fields=None, written=None):
+        def run(game):
+            result = operation(game)
+            try:
+                if scope == "resources":
+                    data = game.read_resources()
+                elif scope == "crews":
+                    data = game.read_crews()
+                elif isinstance(scope, int):
+                    data = game.read_items(scope)
+                else:
+                    data = game.read_sugoroku()
+            except Exception as exc:
+                return result, None, str(exc)
+            return result, data, None
+
+        def done(payload):
+            result, data, read_error = payload
+            if written:
+                written(result)
+            if read_error:
+                self.status_var.set(f"{title}已写入，范围回读失败：{read_error}；请手动刷新确认")
+                messagebox.showwarning("写入已完成", f"写入已完成，但回读失败：{read_error}\n请勿重复提交，请先刷新确认。", parent=self)
+                return
+            if self.state is None:
+                return
+            if scope == "resources":
+                self.state.update(data)
+                for key, var in self.resource_vars.items():
+                    var.set(str(data[key]))
+            elif scope == "crews":
+                self.state["crews"] = data
+                self._update_crew_choices()
+                if not data:
+                    for var in list(self.crew_vars.values()) + self.param_vars + self.add_param_vars:
+                        var.set("")
+                elif fields == "battle":
+                    crew = data[self.selected_crew]
+                    for key in ("battleHP", "battleSP"):
+                        self.crew_vars[key].set(str(crew[key]))
+                else:
+                    self.load_crew_form()
+            elif isinstance(scope, int):
+                self.state["itemsByTab"][scope] = data
+                self.update_items({scope: data})
+            else:
+                self.state["sugoroku"] = data
+                self.update_sugoroku(data, fields=fields)
+            self._update_summary()
+            self.status_var.set(message)
+        return self._submit(title, run, done)
+
+    def _scroll_page(self, notebook, title, padding=10):
+        page = ScrollPage(notebook, padding=padding)
+        notebook.add(page, text=title)
+        self._scroll_pages.append(page)
+        return page.content
+
+    def _route_wheel(self, event):
+        widget = event.widget
+        current = widget
+        while current is not None:
+            if isinstance(current, (ttk.Treeview, tk.Text, tk.Listbox, ttk.Combobox, ttk.Spinbox)):
+                return None
+            if isinstance(current, ScrollPage):
+                return current.wheel(event)
+            current = getattr(current, "master", None)
+        return None
+
+    def _wrap(self, label):
+        label.configure(justify="left", anchor="w")
+        label.bind("<Configure>", lambda event: label.configure(wraplength=max(80, event.width - 4)), add="+")
+        return label
 
     def add_help(self, parent, text):
         label = ttk.Label(parent, text="？", foreground="#1769aa", cursor="question_arrow", takefocus=1)
@@ -1052,7 +440,7 @@ class TrainerApp(tk.Tk):
         style.configure("TLabelframe", background="#f5f6f8")
         style.configure("TLabelframe.Label", background="#f5f6f8", font=self.font_heading, foreground="#1769aa")
         style.configure("TNotebook", background="#f5f6f8")
-        style.configure("TNotebook.Tab", font=self.font_heading, padding=(16, 6))
+        style.configure("TNotebook.Tab", font=self.font_heading, padding=(6, 6))
         style.configure("Treeview", font=self.font_base, rowheight=24)
         style.configure("Treeview.Heading", font=self.font_heading)
         style.configure(
@@ -1092,22 +480,33 @@ class TrainerApp(tk.Tk):
 
         self.notebook = ttk.Notebook(root)
         self.notebook.grid(row=0, column=0, sticky="nsew", pady=(0, 8))
-        overview_page = ttk.Frame(self.notebook, padding=12)
-        item_page = ttk.Frame(self.notebook, padding=12)
-        sugoroku_page = ttk.Frame(self.notebook, padding=12)
-        crew_page = ttk.Frame(self.notebook, padding=12)
-        self.notebook.add(overview_page, text="概览")
+        overview_page = self._scroll_page(self.notebook, "概览")
+        item_page = ttk.Frame(self.notebook, padding=8)
+        sugoroku_page = ttk.Frame(self.notebook, padding=8)
         self.notebook.add(item_page, text="物品修改")
         self.notebook.add(sugoroku_page, text="双六屋")
-        self.notebook.add(crew_page, text="船员属性")
+        crew_page = self._scroll_page(self.notebook, "船员属性")
+        settings_page = self._scroll_page(self.notebook, "修改器设置")
+        self._build_settings(settings_page)
 
         overview_page.columnconfigure(0, weight=1)
 
         connection = ttk.LabelFrame(overview_page, text="游戏连接", padding=10)
         connection.grid(row=0, column=0, sticky="ew", pady=(0, 10))
-        ttk.Button(connection, text="重新连接", style="Accent.TButton", command=self.connect).pack(side="left")
-        ttk.Button(connection, text="刷新数值", command=self.refresh).pack(side="left", padx=8)
-        ttk.Label(connection, textvariable=self.process_var, style="Heading.TLabel").pack(side="left", padx=8)
+        connection.columnconfigure(1, weight=1)
+        connection_tools = ttk.Frame(connection)
+        connection_tools.grid(row=0, column=0, columnspan=2, sticky="ew")
+        ttk.Button(connection_tools, text="重新连接", style="Accent.TButton", command=self.connect).grid(row=0, column=0, padx=(0, 8))
+        ttk.Button(connection_tools, text="刷新数值", command=self.refresh).grid(row=0, column=1, padx=(0, 8))
+        ttk.Button(connection_tools, text="断开连接", command=self.disconnect).grid(row=0, column=2)
+        connection_buttons = connection_tools.winfo_children()
+        def layout_connection(event):
+            columns = 3 if event.width >= 650 else 2
+            for index, button in enumerate(connection_buttons):
+                row, column = divmod(index, columns)
+                button.grid_configure(row=row, column=column, sticky="w", pady=(0, 6))
+        connection_tools.bind("<Configure>", layout_connection)
+        ttk.Label(connection, textvariable=self.process_var, style="Heading.TLabel").grid(row=1, column=0, columnspan=2, sticky="ew", pady=(8, 0))
 
         resources = ttk.LabelFrame(overview_page, text="基础资源数据", padding=12)
         resources.grid(row=1, column=0, sticky="ew", pady=(0, 10))
@@ -1119,14 +518,15 @@ class TrainerApp(tk.Tk):
             row=len(RESOURCE_FIELDS), column=0, columnspan=2, pady=(8, 0), sticky="w"
         )
         resource_actions = ttk.Frame(resources)
-        resource_actions.grid(row=len(RESOURCE_FIELDS) + 1, column=0, columnspan=2, sticky="w", pady=(10, 0))
-        ttk.Button(resource_actions, text="应用资源修改", style="Accent.TButton", command=self.apply_resources).pack(side="left")
-        ttk.Label(resource_actions, text="仅修改本页四项基础资源；首次写入前自动备份存档", style="Hint.TLabel").pack(side="left", padx=10)
+        resource_actions.grid(row=len(RESOURCE_FIELDS) + 1, column=0, columnspan=2, sticky="ew", pady=(10, 0))
+        resource_actions.columnconfigure(0, weight=1)
+        ttk.Button(resource_actions, text="应用资源修改", style="Accent.TButton", command=self.apply_resources).grid(row=0, column=0, sticky="w")
+        ttk.Label(resource_actions, text="仅修改本页四项基础资源；首次写入前自动备份存档", style="Hint.TLabel").grid(row=1, column=0, sticky="ew", pady=(6, 0))
 
         summary = ttk.LabelFrame(overview_page, text="存档概况", padding=12)
         summary.grid(row=2, column=0, sticky="ew")
-        ttk.Label(summary, textvariable=self.summary_var, style="Big.TLabel").pack(anchor="w")
-        ttk.Label(summary, text=f"存档备份目录：{BACKUP_ROOT}", style="Hint.TLabel").pack(anchor="w", pady=(6, 0))
+        ttk.Label(summary, textvariable=self.summary_var, style="Big.TLabel").pack(fill="x")
+        ttk.Label(summary, textvariable=self.backup_hint_var, style="Hint.TLabel").pack(fill="x", pady=(6, 0))
 
         item_page.columnconfigure(0, weight=1)
         item_page.rowconfigure(0, weight=1)
@@ -1139,14 +539,13 @@ class TrainerApp(tk.Tk):
         sugoroku_page.rowconfigure(0, weight=1)
         sugoroku_notebook = ttk.Notebook(sugoroku_page)
         sugoroku_notebook.grid(row=0, column=0, sticky="nsew")
-        dice_tab = ttk.Frame(sugoroku_notebook, padding=12)
-        card_tab = ttk.Frame(sugoroku_notebook, padding=12)
-        sugoroku_notebook.add(dice_tab, text="投掷")
-        sugoroku_notebook.add(card_tab, text="卡片")
+        dice_tab = self._scroll_page(sugoroku_notebook, "投掷")
+        card_tab = self._scroll_page(sugoroku_notebook, "卡片")
 
         dice_tab.columnconfigure(0, weight=1)
         dice_editor = ttk.LabelFrame(dice_tab, text="投掷设置", padding=12)
         dice_editor.grid(row=0, column=0, sticky="ew", pady=(0, 10))
+        dice_editor.columnconfigure(1, weight=1)
         ttk.Label(dice_editor, text="剩余投掷次数").grid(row=0, column=0, sticky="w", pady=4)
         self.dice_remaining_spinbox = ttk.Spinbox(
             dice_editor, from_=0, to=3, textvariable=self.dice_remaining_var, width=6
@@ -1195,10 +594,21 @@ class TrainerApp(tk.Tk):
         ).pack(side="left", padx=(4, 0))
         ttk.Label(dice_editor, textvariable=self.goto_status_var, style="Hint.TLabel").grid(row=6, column=0, columnspan=4, sticky="w", pady=(8, 0))
 
+        dice_rows = {0: 0, 1: 2, 2: 3, 3: 5, 4: 6, 5: 7, 6: 9}
+        for child in dice_editor.winfo_children():
+            position = child.grid_info()
+            row, column = int(position["row"]), int(position["column"])
+            span = int(position.get("columnspan", 1))
+            if column == 3:
+                target = {0: (1, 1), 2: (4, 1), 4: (6, 2), 5: (8, 1)}[row]
+                child.grid_configure(row=target[0], column=target[1], columnspan=1, sticky="w")
+            else:
+                child.grid_configure(row=dice_rows[row], columnspan=2 if row == 4 else min(span, 3), sticky="ew" if column == 1 or span > 1 else "w")
         kairo_editor = ttk.LabelFrame(dice_tab, text="开罗点数", padding=12)
         kairo_editor.grid(row=1, column=0, sticky="ew")
+        kairo_editor.columnconfigure(1, weight=1)
         ttk.Label(kairo_editor, text="开罗点数").grid(row=0, column=0, sticky="w", pady=4)
-        ttk.Entry(kairo_editor, textvariable=self.kairo_point_var, width=14).grid(row=0, column=1, padx=8, pady=4, sticky="w")
+        ttk.Entry(kairo_editor, textvariable=self.kairo_point_var, width=10).grid(row=0, column=1, padx=8, pady=4, sticky="ew")
         ttk.Button(kairo_editor, text="应用开罗点数", style="Accent.TButton", command=self.apply_kairo_point).grid(row=0, column=2, pady=4)
         ttk.Label(kairo_editor, textvariable=self.kairo_point_limit_var, style="Hint.TLabel").grid(row=1, column=0, columnspan=3, sticky="w", pady=(8, 0))
 
@@ -1226,7 +636,7 @@ class TrainerApp(tk.Tk):
         self.card_tree.heading("count", text="当前数量")
         self.card_tree.heading("maximum", text="持有上限")
         self.card_tree.column("checked", width=50, minwidth=40, stretch=False, anchor="center")
-        self.card_tree.column("name", width=280, minwidth=160, stretch=False, anchor="w")
+        self.card_tree.column("name", width=280, minwidth=160, stretch=True, anchor="w")
         self.card_tree.column("count", width=100, minwidth=80, stretch=False, anchor="center")
         self.card_tree.column("maximum", width=110, minwidth=90, stretch=False, anchor="center")
         self.restore_column_widths()
@@ -1242,58 +652,76 @@ class TrainerApp(tk.Tk):
 
         card_editor = ttk.LabelFrame(card_tab, text="批量修改勾选卡片", padding=10)
         card_editor.grid(row=2, column=0, sticky="ew", pady=(10, 0))
-        ttk.Label(card_editor, text="目标数量").pack(side="left")
-        ttk.Entry(card_editor, textvariable=self.card_value_var, width=12).pack(side="left", padx=8)
-        ttk.Button(card_editor, text="修改数量并应用", style="Accent.TButton", command=self.apply_card_value).pack(side="left", padx=(0, 12))
-        ttk.Button(card_editor, text="一键设为上限 - 1", command=self.apply_card_safe_max).pack(side="left", padx=(0, 4))
-        self.add_help(card_editor, "将勾选卡片分别设为各自的实时上限减 1（上限为 1 时直接设为 1），留出余量防止游戏内继续获得时溢出。不同卡片的上限独立计算。").pack(side="left")
+        card_editor.columnconfigure(1, weight=1)
+        ttk.Label(card_editor, text="目标数量").grid(row=0, column=0, sticky="w")
+        ttk.Entry(card_editor, textvariable=self.card_value_var, width=12).grid(row=0, column=1, sticky="ew", padx=8)
+        ttk.Button(card_editor, text="修改数量并应用", style="Accent.TButton", command=self.apply_card_value).grid(row=0, column=2, sticky="e")
+        ttk.Button(card_editor, text="一键设为上限 - 1", command=self.apply_card_safe_max).grid(row=1, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        self.add_help(card_editor, "将勾选卡片分别设为各自的实时上限减 1（上限为 1 时直接设为 1），留出余量防止游戏内继续获得时溢出。不同卡片的上限独立计算。").grid(row=1, column=2, sticky="w", pady=(8, 0))
         ttk.Label(card_tab, textvariable=self.card_limit_var, style="Hint.TLabel").grid(row=3, column=0, sticky="w", pady=(8, 0))
 
         crew_page.columnconfigure(0, weight=1)
         selector = ttk.Frame(crew_page)
         selector.grid(row=0, column=0, sticky="ew", pady=(0, 8))
-        ttk.Label(selector, text="当前船员").pack(side="left")
-        self.crew_selector = ttk.Combobox(selector, textvariable=self.crew_choice_var, state="readonly", width=40)
-        self.crew_selector.pack(side="left", padx=10)
+        selector.columnconfigure(1, weight=1)
+        ttk.Label(selector, text="当前船员").grid(row=0, column=0, sticky="w")
+        self.crew_selector = ttk.Combobox(selector, textvariable=self.crew_choice_var, state="readonly", width=20)
+        self.crew_selector.grid(row=0, column=1, sticky="ew", padx=(10, 0))
         self.crew_selector.bind("<<ComboboxSelected>>", self.on_crew_selected)
 
         basic = ttk.LabelFrame(crew_page, text="船员成长与战斗数值", padding=10)
         basic.grid(row=1, column=0, sticky="ew", pady=(0, 10))
         basic.columnconfigure(1, weight=1)
         basic.columnconfigure(3, weight=1)
-        basic.columnconfigure(5, weight=1)
-        basic.columnconfigure(7, weight=1)
-        for column, (key, label) in enumerate((("level", "等级"), ("exp", "经验"), ("battleHP", "当前战斗 HP"), ("battleSP", "当前战斗 SP"))):
-            ttk.Label(basic, text=label).grid(row=0, column=column * 2, padx=(0, 5), sticky="w")
-            ttk.Entry(basic, textvariable=self.crew_vars[key], width=10).grid(row=0, column=column * 2 + 1, padx=(0, 12), sticky="ew")
-        ttk.Button(basic, text="战斗 HP/SP 恢复满", command=self.apply_crew_restore).grid(row=1, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        basic_fields = []
+        for index, (key, label) in enumerate((("level", "等级"), ("exp", "经验"), ("battleHP", "当前战斗 HP"), ("battleSP", "当前战斗 SP"))):
+            row, column = divmod(index, 2)
+            caption = ttk.Label(basic, text=label)
+            entry = ttk.Entry(basic, textvariable=self.crew_vars[key], width=10)
+            caption.grid(row=row, column=column * 2, padx=(0, 5), pady=4, sticky="w")
+            entry.grid(row=row, column=column * 2 + 1, padx=(0, 8), pady=4, sticky="ew")
+            basic_fields.append((caption, entry))
+        ttk.Button(basic, text="战斗 HP/SP 恢复满", command=self.apply_crew_restore).grid(row=2, column=0, columnspan=2, sticky="w", pady=(8, 0))
         self.add_help(
             basic,
             "按游戏当前计算出的 HP/SP 上限（基础+额外成长+职业成长+装备+技能+同伴/船只全部加成后的生效值），"
             "把当前船员的战斗 HP、战斗 SP 写满。只恢复战斗数值，不修改等级、经验和六项属性。",
-        ).grid(row=1, column=2, sticky="w", padx=(6, 0), pady=(8, 0))
+        ).grid(row=2, column=2, sticky="w", padx=(6, 0), pady=(8, 0))
+
+        restore_widgets = basic.winfo_children()[-2:]
+        def layout_basic(event):
+            groups = 2 if event.width >= 700 else 1
+            basic.columnconfigure(3, weight=1 if groups == 2 else 0)
+            for index, (caption, entry) in enumerate(basic_fields):
+                row, group = divmod(index, groups)
+                caption.grid_configure(row=row, column=group * 2)
+                entry.grid_configure(row=row, column=group * 2 + 1)
+            restore_row = 4 // groups
+            restore_widgets[0].grid_configure(row=restore_row, column=0, columnspan=1)
+            restore_widgets[1].grid_configure(row=restore_row, column=1)
+        basic.bind("<Configure>", layout_basic)
 
         params = ttk.LabelFrame(crew_page, text="六项基础属性（param_）", padding=10)
         params.grid(row=2, column=0, sticky="ew", pady=(0, 10))
         params.columnconfigure(1, weight=1)
         params.columnconfigure(3, weight=1)
-        params.columnconfigure(5, weight=1)
         self._param_entries(params, self.param_vars)
 
         additions = ttk.LabelFrame(crew_page, text="六项额外成长（addParam_）", padding=10)
         additions.grid(row=3, column=0, sticky="ew", pady=(0, 10))
         additions.columnconfigure(1, weight=1)
         additions.columnconfigure(3, weight=1)
-        additions.columnconfigure(5, weight=1)
         self._param_entries(additions, self.add_param_vars)
         for var in self.param_vars + self.add_param_vars:
             var.trace_add("write", lambda *_args: self.update_crew_headroom())
 
         crew_actions = ttk.Frame(crew_page)
         crew_actions.grid(row=4, column=0, sticky="ew", pady=(10, 0))
-        ttk.Button(crew_actions, text="应用船员修改", style="Accent.TButton", command=self.apply_crew).pack(side="left")
-        ttk.Label(crew_actions, text="仅修改当前选中的 1 名船员；首次写入前自动备份存档", style="Hint.TLabel").pack(side="left", padx=10)
-        ttk.Button(crew_actions, text="一键拉满上限", command=self.apply_crew_max).pack(side="left", padx=(14, 0))
+        crew_actions.columnconfigure(0, weight=1)
+        crew_actions.columnconfigure(1, weight=1)
+        ttk.Button(crew_actions, text="应用船员修改", style="Accent.TButton", command=self.apply_crew).grid(row=0, column=0, sticky="w")
+        ttk.Label(crew_actions, text="仅修改当前选中的 1 名船员；首次写入前自动备份存档", style="Hint.TLabel").grid(row=1, column=0, columnspan=3, sticky="ew", pady=(6, 0))
+        ttk.Button(crew_actions, text="一键拉满上限", command=self.apply_crew_max).grid(row=0, column=1, sticky="e")
         self.add_help(
             crew_actions,
             "一键将当前船员六项基础设为 10000、额外成长设为 9980000（HP/SP/攻/防/速 合计 9990000，"
@@ -1301,7 +729,7 @@ class TrainerApp(tk.Tk):
             "百分比放大，两处都是 32 位乘法，合计超过约 1000 万就会溢出，导致打不动怪、被秒杀或恢复异常，"
             "探索直接失败。生效数值约 1000 万，已足够秒杀一切，且会显著降低游戏乐趣，请确认后再使用；"
             "首次写入前会自动备份存档。",
-        ).pack(side="left", padx=(4, 0))
+        ).grid(row=0, column=2, padx=(4, 0), sticky="e")
         self.crew_headroom_label = ttk.Label(crew_page, textvariable=self.crew_headroom_var, style="Hint.TLabel")
         self.crew_headroom_label.grid(row=5, column=0, sticky="w", pady=(8, 0))
         ttk.Label(
@@ -1314,10 +742,18 @@ class TrainerApp(tk.Tk):
         self.status_label = ttk.Label(root, textvariable=self.status_var, style="Status.Info.TLabel", relief="sunken", anchor="w", padding=6)
         self.status_label.grid(row=1, column=0, sticky="ew")
         self.status_var.trace_add("write", self._recolor_status)
+        def wrap_labels(widget):
+            if isinstance(widget, ttk.Label) and (widget.cget("style") in ("Hint.TLabel", "Big.TLabel", "Heading.TLabel") or widget is self.status_label):
+                widget.configure(wraplength=120)
+                if widget.winfo_manager() == "grid":
+                    widget.grid_configure(sticky="ew")
+                self._wrap(widget)
+            for child in widget.winfo_children():
+                wrap_labels(child)
+        wrap_labels(root)
 
     def _build_item_tab(self, notebook, tab, tab_name):
-        page = ttk.Frame(notebook, padding=12)
-        notebook.add(page, text=tab_name)
+        page = self._scroll_page(notebook, tab_name, padding=8)
         page.columnconfigure(0, weight=1)
         page.rowconfigure(1, weight=1)
         info = self.item_tabs[tab]
@@ -1343,7 +779,7 @@ class TrainerApp(tk.Tk):
         tree.heading("count", text="当前数量")
         tree.heading("maximum", text="当前持有上限")
         tree.column("checked", width=50, minwidth=40, stretch=False, anchor="center")
-        tree.column("name", width=260, minwidth=160, stretch=False, anchor="w")
+        tree.column("name", width=260, minwidth=160, stretch=True, anchor="w")
         tree.column("count", width=100, minwidth=80, stretch=False, anchor="center")
         tree.column("maximum", width=110, minwidth=90, stretch=False, anchor="center")
         tree.grid(row=0, column=0, sticky="nsew")
@@ -1359,67 +795,86 @@ class TrainerApp(tk.Tk):
 
         editor = ttk.LabelFrame(page, text=f"批量修改勾选{tab_name}", padding=10)
         editor.grid(row=2, column=0, sticky="ew", pady=(10, 0))
-        ttk.Label(editor, text="目标数量").pack(side="left")
-        ttk.Entry(editor, textvariable=info["value_var"], width=12).pack(side="left", padx=8)
-        ttk.Button(editor, text="修改数值并应用", style="Accent.TButton", command=lambda: self.apply_item_value(tab)).pack(side="left", padx=(8, 12))
-        ttk.Button(editor, text="一键设为上限 - 9", command=lambda: self.apply_item_safe_max(tab)).pack(side="left", padx=(0, 4))
-        self.add_help(editor, "将勾选物品分别设为各自的实时上限减 9，留出余量防止游戏内继续获得时溢出。不同物品的上限独立计算。").pack(side="left")
+        editor.columnconfigure(1, weight=1)
+        ttk.Label(editor, text="目标数量").grid(row=0, column=0, sticky="w")
+        ttk.Entry(editor, textvariable=info["value_var"], width=12).grid(row=0, column=1, padx=8, sticky="ew")
+        ttk.Button(editor, text="修改数值并应用", style="Accent.TButton", command=lambda: self.apply_item_value(tab)).grid(row=0, column=2, sticky="e")
+        ttk.Button(editor, text="一键设为上限 - 9", command=lambda: self.apply_item_safe_max(tab)).grid(row=1, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        self.add_help(editor, "将勾选物品分别设为各自的实时上限减 9，留出余量防止游戏内继续获得时溢出。不同物品的上限独立计算。").grid(row=1, column=2, sticky="w", pady=(8, 0))
         ttk.Label(page, textvariable=info["limit_var"], style="Hint.TLabel").grid(row=3, column=0, sticky="w", pady=(8, 0))
 
     def _param_entries(self, parent, variables):
         for index, name in enumerate(PARAM_NAMES):
-            row, group = divmod(index, 3)
+            row, group = divmod(index, 2)
             ttk.Label(parent, text=name).grid(row=row, column=group * 2, padx=(0, 6), pady=3, sticky="w")
-            ttk.Entry(parent, textvariable=variables[index], width=14).grid(row=row, column=group * 2 + 1, padx=(0, 22), pady=3, sticky="ew")
+            ttk.Entry(parent, textvariable=variables[index], width=10).grid(row=row, column=group * 2 + 1, padx=(0, 8), pady=3, sticky="ew")
 
     def connect(self):
-        try:
-            self.game.connect()
-            self.process_var.set(f"已连接：{GAME_NAME}（PID {self.game.pid}）")
-            self.refresh()
-        except Exception as exc:
-            self.process_var.set("未连接")
-            self.status_var.set("连接失败")
-            messagebox.showerror("连接失败", str(exc), parent=self)
+        if self._busy is not None or self._closing or self._close_failed:
+            return
+        self._reset_connection()
+        def run(game):
+            game.connect()
+            try:
+                return game.pid, game.read_state(), None
+            except Exception as exc:
+                return game.pid, None, str(exc)
+        def done(result):
+            pid, state, error = result
+            self._connected = True
+            self.process_var.set(f"已连接：{GAME_NAME}（PID {pid}）")
+            if error:
+                self.status_var.set(f"游戏已连接，读取失败：{error}")
+                messagebox.showwarning("游戏已连接", f"读取失败：{error}\n进入存档后可手动刷新。", parent=self)
+            else:
+                self.update_state(state)
+                self.status_var.set("已连接并读取全部数据")
+        self._submit("连接游戏", run, done, require_connection=False)
 
     def refresh(self):
-        try:
-            state = self.game.read_state()
+        def done(state):
             self.update_state(state)
-            items = state["itemsByTab"]
-            self.status_var.set(
-                f"已读取资源、{len(state['crews'])} 名船员、武器 {len(items[0])} 件、道具 {len(items[1])} 件、"
-                f"强化食物 {len(items[2])} 件与 {len(state['sugoroku']['cards'])} 张双六卡片"
-            )
-        except Exception as exc:
-            self.status_var.set("读取失败")
-            messagebox.showerror("读取失败", str(exc), parent=self)
+            self.status_var.set("已刷新资源、船员、三个物品页与双六数据")
+        self._submit("刷新全部数值", lambda game: game.read_state(), done)
 
     def update_state(self, state):
         self.state = state
         for key in self.resource_vars:
             self.resource_vars[key].set(str(state[key]))
-        self.update_items(state["itemsByTab"])
+        self.update_items(dict(enumerate(state["itemsByTab"])))
         self.update_sugoroku(state["sugoroku"])
-        items = state["itemsByTab"]
+        self._update_summary()
+        self._update_crew_choices()
+        if state["crews"]:
+            self.load_crew_form()
+
+    def _update_summary(self):
+        if not self.state:
+            return
+        items = self.state["itemsByTab"]
         self.summary_var.set(
-            f"{len(state['crews'])} 名船员  ·  武器 {len(items[0])} 件  ·  道具 {len(items[1])} 件  ·  "
-            f"强化食物 {len(items[2])} 件  ·  {len(state['sugoroku']['cards'])} 张双六卡片"
+            f"{len(self.state['crews'])} 名船员  ·  武器 {len(items[0])} 件  ·  道具 {len(items[1])} 件  ·  "
+            f"强化食物 {len(items[2])} 件  ·  {len(self.state['sugoroku']['cards'])} 张双六卡片"
         )
+
+    def _update_crew_choices(self):
         choices = [
             f"{crew['index'] + 1}. {self.display_name(crew['name'])}  Lv.{crew['level']}"
-            for crew in state["crews"]
+            for crew in self.state["crews"]
         ]
         self.crew_selector.configure(values=choices)
         if not choices:
+            self.selected_crew = 0
             self.crew_choice_var.set("当前存档没有可编辑船员")
+            for var in list(self.crew_vars.values()) + self.param_vars + self.add_param_vars:
+                var.set("")
+            self.crew_headroom_var.set("当前存档没有可编辑船员")
             return
         self.selected_crew = min(self.selected_crew, len(choices) - 1)
         self.crew_selector.current(self.selected_crew)
-        self.load_crew_form()
 
     def update_items(self, items_by_tab):
-        for tab, items in enumerate(items_by_tab):
+        for tab, items in items_by_tab.items():
             info = self.item_tabs[tab]
             tree = info["tree"]
             selected = set(tree.selection())
@@ -1504,9 +959,8 @@ class TrainerApp(tk.Tk):
             items = {item["id"]: item for item in self.state["itemsByTab"][tab]}
             maximum = min(items[index]["maximum"] for index in indices)
             value = self.parse_number(self.item_tabs[tab]["value_var"].get(), "物品数量", maximum)
-            result = self.game.apply_tab_items(tab, indices, value=value)
-            self.update_state(result)
-            self.status_var.set(f"已将 {len(indices)} 种物品数量写为 {value}，并回读校验成功")
+            self._write("物品修改", lambda game: game.apply_tab_items(tab, indices, value=value), tab,
+                        f"已将 {len(indices)} 种物品数量写为 {value}，并完成本页回读")
         except Exception as exc:
             self.status_var.set("物品修改失败")
             messagebox.showerror("物品修改失败", str(exc), parent=self)
@@ -1517,39 +971,34 @@ class TrainerApp(tk.Tk):
             messagebox.showerror("无法应用", "请先勾选要修改的物品", parent=self)
             return
         try:
-            result = self.game.apply_tab_items(tab, indices, safe_max=True)
-            self.update_state(result)
-            self.status_var.set(f"已将 {len(indices)} 种物品设为各自实时上限 - 9，并回读校验成功")
+            self._write("物品修改", lambda game: game.apply_tab_items(tab, indices, safe_max=True), tab,
+                        f"已将 {len(indices)} 种物品设为各自实时上限 - 9，并完成本页回读")
         except Exception as exc:
             self.status_var.set("物品修改失败")
             messagebox.showerror("物品修改失败", str(exc), parent=self)
 
-    def update_sugoroku(self, sugoroku):
-        locked = bool(sugoroku.get("stepLocked"))
-        if self.lock_step_var.get() != locked:
+    def update_sugoroku(self, sugoroku, fields=None):
+        if fields in (None, "step"):
+            locked = bool(sugoroku.get("stepLocked"))
             self.lock_step_var.set(locked)
-        if locked:
-            self.dice_count_var.set(str(sugoroku.get("stepLockDiceCount", 1)))
-            self.dice_step_var.set(str(sugoroku.get("stepLockTotal", self.dice_step_var.get())))
-        else:
-            self.dice_step_var.set(str(sugoroku.get("step", 0)))
-        self.dice_remaining_var.set(str(sugoroku["remaining"]))
-        self.kairo_point_var.set(str(sugoroku.get("kairoPoint", 0)))
-        if sugoroku.get("kairoReady", True):
-            self.kairo_point_limit_var.set("可输入 0 到 2147483647，写入时通过游戏自身的数值对象安全应用")
-        else:
-            self.kairo_point_limit_var.set("开罗点数尚未初始化，请进入正常游戏界面后刷新")
-        board = sugoroku.get("board") or {}
-        if board.get("ready"):
-            grid_max = board.get("gridMax", 0)
-            self.board_info_var.set(
-                f"当前棋盘：第 {board['level'] + 1} 关（本关共 {grid_max} 格）· 当前第 {board['pos']} 格"
-            )
-            if grid_max > 0:
-                self.goto_spinbox.configure(to=grid_max)
-        else:
-            self.board_info_var.set("双六对局数据尚未初始化，进入双六屋一次后刷新即可读取棋盘状态")
-            self.goto_spinbox.configure(to=200)
+            if locked:
+                self.dice_count_var.set(str(sugoroku.get("stepLockDiceCount", 1)))
+                self.dice_step_var.set(str(sugoroku.get("stepLockTotal", 0)))
+            else:
+                self.dice_step_var.set(str(sugoroku.get("step", 0)))
+        if fields in (None, "remaining"):
+            self.dice_remaining_var.set(str(sugoroku["remaining"]))
+            self.dice_remaining_spinbox.configure(to=sugoroku.get("maximum", 3))
+        if fields in (None, "kairoPoint"):
+            self.kairo_point_var.set(str(sugoroku.get("kairoPoint", 0)))
+            if sugoroku.get("kairoReady", True):
+                self.kairo_point_limit_var.set("可输入 0 到 2147483647，写入时通过游戏自身的数值对象安全应用")
+            else:
+                self.kairo_point_limit_var.set("开罗点数尚未初始化，请进入正常游戏界面后刷新")
+        if fields is None:
+            self._update_board_ui(sugoroku.get("board") or {})
+        if fields not in (None, "cards"):
+            return
         selected = set(self.card_tree.selection())
         valid_ids = {str(card["index"]) for card in sugoroku["cards"]}
         self.checked_cards.intersection_update(valid_ids)
@@ -1631,9 +1080,8 @@ class TrainerApp(tk.Tk):
             cards = {card["index"]: card for card in self.state["sugoroku"]["cards"]}
             maximum = min(cards[index]["maximum"] for index in indices)
             value = self.parse_number(self.card_value_var.get(), "卡片数量", maximum)
-            result = self.game.apply_cards(indices, value=value)
-            self.update_state(result)
-            self.status_var.set(f"已将 {len(indices)} 张卡片数量写为 {value}，并回读校验成功")
+            self._write("卡片修改", lambda game: game.apply_cards(indices, value=value), "sugoroku",
+                        f"已将 {len(indices)} 张卡片数量写为 {value}，并完成卡片回读", fields="cards")
         except Exception as exc:
             self.status_var.set("卡片修改失败")
             messagebox.showerror("卡片修改失败", str(exc), parent=self)
@@ -1644,52 +1092,48 @@ class TrainerApp(tk.Tk):
             messagebox.showerror("无法应用", "请先勾选要修改的卡片", parent=self)
             return
         try:
-            result = self.game.apply_cards(indices, safe_max=True)
-            self.update_state(result)
-            self.status_var.set(f"已将 {len(indices)} 张卡片设为各自实时上限 - 1，并回读校验成功")
+            self._write("卡片修改", lambda game: game.apply_cards(indices, safe_max=True), "sugoroku",
+                        f"已将 {len(indices)} 张卡片设为各自实时上限 - 1，并完成卡片回读", fields="cards")
         except Exception as exc:
             self.status_var.set("卡片修改失败")
             messagebox.showerror("卡片修改失败", str(exc), parent=self)
 
     def apply_dice_step(self):
         try:
-            count = int(self.dice_count_var.get())
+            count = self.parse_number(self.dice_count_var.get(), "骰子数量", 3, 1)
             value = self.parse_number(self.dice_step_var.get(), "总步数", 99, count)
-            result = self.game.apply_sugoroku({"step": value, "diceCount": count})
-            if self.lock_step_var.get():
-                self.game.set_step_lock(value, count)
-                result = self.game.read_state()
-                self.status_var.set(f"已锁定 {count} 颗骰子的总步数为 {value}，每次投掷都会重新应用")
-            else:
-                self.status_var.set(f"已将 {count} 颗骰子的总步数设为 {value}；下一次投掷将强制使用该步数")
-            self.update_state(result)
+            locked = self.lock_step_var.get()
+            def run(game):
+                if locked:
+                    game.ensure_backup()
+                    return game.set_step_lock(value, count)
+                return game.apply_sugoroku({"step": value, "diceCount": count})
+            self._write("步数修改", run, "sugoroku",
+                        f"已设置 {count} 颗骰子合计 {value} 步（{'持续锁定' if locked else '下一次投掷'}）", fields="step")
         except Exception as exc:
-            self.status_var.set("步数修改失败")
             messagebox.showerror("步数修改失败", str(exc), parent=self)
 
     def toggle_lock_step(self):
-        if self.lock_step_var.get():
-            try:
-                count = int(self.dice_count_var.get())
-                value = self.parse_number(self.dice_step_var.get(), "总步数", 99, count)
-                result = self.game.apply_sugoroku({"step": value, "diceCount": count})
-                self.game.set_step_lock(value, count)
-                self.update_state(self.game.read_state())
-                self.status_var.set(f"已启用步数锁定：{count} 颗骰子合计 {value} 步，每次投掷都会应用")
-            except Exception as exc:
-                self.lock_step_var.set(False)
-                try:
-                    self.game.clear_step_lock()
-                except Exception:
-                    pass
-                self.status_var.set("步数锁定失败")
-                messagebox.showerror("步数锁定失败", str(exc), parent=self)
-        else:
-            try:
-                self.game.clear_step_lock()
-            except Exception:
-                pass
-            self.status_var.set("已停用步数锁定")
+        enabled = self.lock_step_var.get()
+        try:
+            count = self.parse_number(self.dice_count_var.get(), "骰子数量", 3, 1) if enabled else 1
+            value = self.parse_number(self.dice_step_var.get(), "总步数", 99, count) if enabled else 0
+            def run(game):
+                if enabled:
+                    game.ensure_backup()
+                    return game.set_step_lock(value, count)
+                return game.clear_step_lock()
+            def done(_result):
+                self.lock_step_var.set(enabled)
+                if self.state:
+                    self.state["sugoroku"]["stepLocked"] = enabled
+                self.status_var.set(f"已启用步数锁定：{count} 颗骰子合计 {value} 步" if enabled else "已停用步数锁定")
+            accepted = self._submit("设置步数锁定", run, done, lambda _exc: self.lock_step_var.set(not enabled))
+            if not accepted:
+                self.lock_step_var.set(not enabled)
+        except Exception as exc:
+            self.lock_step_var.set(not enabled)
+            messagebox.showerror("步数锁定失败", str(exc), parent=self)
 
     def apply_goto(self):
         try:
@@ -1703,127 +1147,143 @@ class TrainerApp(tk.Tk):
             current = board.get("pos", 0)
             if target <= current:
                 raise ValueError(f"目标格必须大于当前所在格数（当前第 {current} 格）")
-            result = self.game.set_goto_cell(target)
-            self.goto_status_var.set(
-                f"目标：第 {target} 格（第 {result['level'] + 1} 关，当前第 {result['pos']} 格，本关共 {result['gridMax']} 格）"
-            )
-            self.status_var.set(f"已设置目标格 {target}，下一次投掷将自动走过去")
+            def run(game):
+                game.ensure_backup()
+                return game.set_goto_cell(target)
+            def done(result):
+                self.goto_status_var.set(
+                    f"目标：第 {target} 格（第 {result['level'] + 1} 关，当前第 {result['pos']} 格，本关共 {result['gridMax']} 格）"
+                )
+                self.status_var.set(f"已设置目标格 {target}，下一次投掷将自动走过去")
+            self._submit("设置目标格", run, done)
         except Exception as exc:
             self.status_var.set("目标格设置失败")
             messagebox.showerror("目标格设置失败", str(exc), parent=self)
 
     def clear_goto(self):
-        try:
-            self.game.clear_goto_cell()
+        def done(_result):
             self.goto_status_var.set("已取消目标格")
             self.status_var.set("已取消目标格")
-        except Exception as exc:
-            self.status_var.set("取消目标格失败")
-            messagebox.showerror("取消目标格失败", str(exc), parent=self)
+        self._submit("取消目标格", lambda game: game.clear_goto_cell(), done)
+
+    def _update_board_ui(self, board):
+        if board.get("ready"):
+            grid_max = board.get("gridMax", 0)
+            self.board_info_var.set(
+                f"当前棋盘：第 {board['level'] + 1} 关（本关共 {grid_max} 格）· 当前第 {board['pos']} 格"
+            )
+            self.goto_spinbox.configure(to=grid_max if grid_max > 0 else 200)
+        else:
+            self.board_info_var.set("双六对局数据尚未初始化，进入双六屋一次后刷新")
+            self.goto_spinbox.configure(to=200)
 
     def refresh_board(self):
-        try:
-            info = self.game.read_board()
+        def done(info):
             board = info.get("board") or {}
             if self.state is not None:
-                self.state.setdefault("sugoroku", {})["board"] = board
-            if board.get("ready"):
-                grid_max = board.get("gridMax", 0)
-                self.board_info_var.set(
-                    f"当前棋盘：第 {board['level'] + 1} 关（本关共 {grid_max} 格）· 当前第 {board['pos']} 格"
-                )
-                if grid_max > 0:
-                    self.goto_spinbox.configure(to=grid_max)
-            else:
-                self.board_info_var.set("双六对局数据尚未初始化，进入双六屋一次后刷新")
+                self.state["sugoroku"]["board"] = board
+            self._update_board_ui(board)
             notice = info.get("gotoNotice")
             if notice:
                 self.goto_status_var.set(notice)
             elif info.get("gotoTarget") is not None:
                 self.goto_status_var.set(f"目标：第 {info['gotoTarget']} 格（已设置，等待下一次投掷）")
             self.status_var.set("已刷新棋盘位置")
-        except Exception as exc:
-            self.status_var.set("刷新棋盘失败")
-            messagebox.showerror("刷新棋盘失败", str(exc), parent=self)
+        self._submit("刷新棋盘", lambda game: game.read_board(), done)
 
     def apply_dice_remaining(self):
         try:
-            info = self.game.read_sugoroku_remaining()
-            maximum = info["maximum"]
+            if not self.state:
+                raise ValueError("请先刷新读取数据")
+            maximum = self.state["sugoroku"].get("maximum", 3)
             value = self.parse_number(self.dice_remaining_var.get(), "剩余投掷次数", maximum)
-            if self.lock_remaining_var.get():
-                self._lock_target_value = value
-                result = self.game.write_sugoroku_remaining(value)
-                self.dice_remaining_var.set(str(result["remaining"]))
-                self._lock_failures = 0
-                self.status_var.set(f"锁定目标已更新为 {value}")
-                return
-            result = self.game.apply_sugoroku({"remaining": value})
-            self.update_state(result)
-            self.status_var.set(f"已将剩余投掷次数设为 {value}，并回读校验成功")
+            def written(_result):
+                if self.lock_remaining_var.get():
+                    self._lock_target_value = value
+                    self._lock_failures = 0
+            self._write("次数修改", lambda game: game.apply_sugoroku({"remaining": value}), "sugoroku",
+                        f"已将剩余投掷次数设为 {value}，并完成范围回读", fields="remaining", written=written)
         except Exception as exc:
-            self.status_var.set("次数修改失败")
             messagebox.showerror("次数修改失败", str(exc), parent=self)
 
     def apply_kairo_point(self):
         try:
             value = self.parse_number(self.kairo_point_var.get(), "开罗点数", 2147483647)
-            result = self.game.apply_sugoroku({"kairoPoint": value})
-            self.update_state(result)
-            self.status_var.set(f"已将开罗点数设为 {value}，并回读校验成功")
+            self._write("开罗点数修改", lambda game: game.apply_sugoroku({"kairoPoint": value}), "sugoroku",
+                        f"已将开罗点数设为 {value}，并完成范围回读", fields="kairoPoint")
         except Exception as exc:
-            self.status_var.set("开罗点数修改失败")
             messagebox.showerror("开罗点数修改失败", str(exc), parent=self)
 
     def toggle_lock_remaining(self):
-        if self.lock_remaining_var.get():
-            try:
-                info = self.game.read_sugoroku_remaining()
-                maximum = info["maximum"]
-                target = self.parse_number(self.dice_remaining_var.get(), "剩余投掷次数", maximum)
-                self.game.ensure_backup()
-                self._lock_target_value = target
-                self._lock_failures = 0
-                if info["remaining"] != target:
-                    result = self.game.write_sugoroku_remaining(target)
-                    self.dice_remaining_var.set(str(result["remaining"]))
-                self.status_var.set(f"已启用剩余投掷次数锁定（目标值：{target}，每 0.7 秒检查一次）")
-                self._lock_remaining_loop()
-            except Exception as exc:
-                self.lock_remaining_var.set(False)
-                self._stop_lock_remaining()
-                self.status_var.set("锁定失败")
-                messagebox.showerror("锁定失败", str(exc), parent=self)
-        else:
+        enabled = self.lock_remaining_var.get()
+        if not enabled:
             self._stop_lock_remaining()
-            try:
-                info = self.game.read_sugoroku_remaining()
-                self.dice_remaining_var.set(str(info["remaining"]))
-            except Exception:
-                pass
             self.status_var.set("已停用剩余投掷次数锁定")
-
-    def _lock_remaining_loop(self):
-        if not self.lock_remaining_var.get():
             return
         try:
-            info = self.game.read_sugoroku_remaining()
-            target = min(self._lock_target_value, info["maximum"])
-            self._lock_target_value = target
-            if info["remaining"] != target:
-                result = self.game.write_sugoroku_remaining(target)
+            if not self.state:
+                raise ValueError("请先刷新读取数据")
+            maximum = self.state["sugoroku"].get("maximum", 3)
+            target = self.parse_number(self.dice_remaining_var.get(), "剩余投掷次数", maximum)
+            def run(game):
+                game.ensure_backup()
+                return game.write_sugoroku_remaining(target)
+            def done(result):
+                self._lock_target_value = target
+                self._lock_failures = 0
                 self.dice_remaining_var.set(str(result["remaining"]))
-                self.status_var.set(f"已恢复剩余投掷次数为 {target}")
-            self._lock_failures = 0
+                self.status_var.set(f"已启用剩余投掷次数锁定（目标 {target}，每 {self._lock_interval() / 1000:g} 秒检查）")
+                self._schedule_lock()
+            def failed(_error):
+                self.lock_remaining_var.set(False)
+                self._stop_lock_remaining()
+            if not self._submit("启用次数锁定", run, done, failed):
+                self.lock_remaining_var.set(False)
         except Exception as exc:
+            self.lock_remaining_var.set(False)
+            self._stop_lock_remaining()
+            messagebox.showerror("锁定失败", str(exc), parent=self)
+
+    def _lock_interval(self):
+        return self.settings.get("lock_interval_ms", DEFAULT_LOCK_INTERVAL_MS)
+
+    def _schedule_lock(self):
+        if self._lock_timer_id is not None:
+            self.after_cancel(self._lock_timer_id)
+        if self.lock_remaining_var.get() and not self._closing:
+            self._lock_timer_id = self.after(self._lock_interval(), self._lock_remaining_loop)
+
+    def _lock_remaining_loop(self):
+        self._lock_timer_id = None
+        if not self.lock_remaining_var.get() or self._closing or not self._connected:
+            return
+        if self._busy is not None:
+            self._schedule_lock()
+            return
+        target = self._lock_target_value
+        def run(game):
+            info = game.read_sugoroku_remaining()
+            value = min(target, info["maximum"])
+            if info["remaining"] != value:
+                info = game.write_sugoroku_remaining(value)
+            return info, value
+        def done(result):
+            info, value = result
+            self._lock_target_value = value
+            self._lock_failures = 0
+            if self.state:
+                self.state["sugoroku"]["remaining"] = info["remaining"]
+            self._schedule_lock()
+        def failed(error):
             self._lock_failures += 1
-            self.status_var.set(f"锁定检查失败（{self._lock_failures}/3）：{exc}")
+            self.status_var.set(f"锁定检查失败（{self._lock_failures}/3）：{error}")
             if self._lock_failures >= 3:
                 self.lock_remaining_var.set(False)
                 self._stop_lock_remaining()
                 self.status_var.set("锁定已停止：连续读取或写入失败，请进入游戏并刷新数值")
-                return
-        self._lock_timer_id = self.after(700, self._lock_remaining_loop)
+            else:
+                self._schedule_lock()
+        self._submit("检查次数锁定", run, done, failed, quiet=True)
 
     def _stop_lock_remaining(self):
         if self._lock_timer_id is not None:
@@ -1833,16 +1293,70 @@ class TrainerApp(tk.Tk):
 
     def load_settings(self):
         try:
-            data = json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            return {}
-        return data if isinstance(data, dict) else {}
+            return self.settings_store.load()
+        except Exception as exc:
+            self._settings_error = str(exc)
+            return {"backup_root": str(DEFAULT_BACKUP_ROOT), "lock_interval_ms": DEFAULT_LOCK_INTERVAL_MS, "auto_connect": True}
+
+    def _build_settings(self, page):
+        page.columnconfigure(0, weight=1)
+        backup = ttk.LabelFrame(page, text="存档备份", padding=12)
+        backup.grid(row=0, column=0, sticky="ew", pady=(0, 10))
+        backup.columnconfigure(0, weight=1)
+        ttk.Label(backup, text="备份目录").grid(row=0, column=0, sticky="w")
+        ttk.Entry(backup, textvariable=self.backup_root_var).grid(row=1, column=0, sticky="ew", pady=(6, 0), padx=(0, 8))
+        ttk.Button(backup, text="浏览……", command=self.browse_backup_root).grid(row=1, column=1, pady=(6, 0))
+        ttk.Label(backup, text="首次游戏写入前自动备份；备份目录必须位于游戏安装目录之外。", style="Hint.TLabel").grid(row=2, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        behavior = ttk.LabelFrame(page, text="连接与锁定", padding=12)
+        behavior.grid(row=1, column=0, sticky="ew", pady=(0, 12))
+        behavior.columnconfigure(1, weight=1)
+        ttk.Label(behavior, text="锁定轮询间隔（秒）").grid(row=0, column=0, sticky="w", padx=(0, 10))
+        ttk.Spinbox(behavior, from_=0.2, to=10, increment=0.1, textvariable=self.lock_interval_var, width=8).grid(row=0, column=1, sticky="ew")
+        ttk.Label(behavior, text="允许 0.2–10 秒，影响剩余投掷次数锁定的检查频率。", style="Hint.TLabel").grid(row=1, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        ttk.Checkbutton(behavior, text="启动时自动连接游戏", variable=self.auto_connect_var).grid(row=2, column=0, columnspan=2, sticky="w", pady=(10, 0))
+        ttk.Button(page, text="保存设置", style="Accent.TButton", command=self.save_preferences).grid(row=2, column=0, sticky="w")
+
+    def browse_backup_root(self):
+        path = filedialog.askdirectory(parent=self, title="选择存档备份目录", initialdir=self.backup_root_var.get() or str(DEFAULT_BACKUP_ROOT))
+        if path:
+            self.backup_root_var.set(path)
+
+    def save_preferences(self):
+        try:
+            root = validate_backup_root(self.backup_root_var.get())
+            seconds = float(self.lock_interval_var.get())
+            if not 0.2 <= seconds <= 10:
+                raise ValueError("锁定轮询间隔必须在 0.2 到 10 秒之间")
+            interval = round(seconds * 1000)
+            def run(game):
+                old_root = game.backup_root
+                game.set_backup_root(root)
+                return old_root
+            def done(old_root):
+                data = dict(self.settings)
+                data.update(backup_root=str(root), lock_interval_ms=interval, auto_connect=self.auto_connect_var.get())
+                try:
+                    self.settings_store.save(data)
+                except Exception as exc:
+                    self._submit("恢复备份目录设置", lambda game: game.set_backup_root(old_root), require_connection=False)
+                    messagebox.showerror("设置保存失败", str(exc), parent=self)
+                    return
+                self.settings = data
+                self.backup_root_var.set(str(root))
+                self.backup_hint_var.set(f"存档备份目录：{root}")
+                self.lock_interval_var.set(f"{interval / 1000:g}")
+                if self.lock_remaining_var.get():
+                    self._schedule_lock()
+                self.status_var.set(f"已保存设置；锁定检查间隔 {interval / 1000:g} 秒")
+            self._submit("保存设置", run, done, require_connection=False)
+        except Exception as exc:
+            messagebox.showerror("设置无效", str(exc), parent=self)
 
     def restore_column_widths(self):
-        pairs = [(self.card_tree, "card_columns")]
-        pairs += [(self.item_tabs[tab]["tree"], "item_columns") for tab in sorted(self.item_tabs)]
-        for tree, key in pairs:
-            saved = self.settings.get(key)
+        pairs = [(self.card_tree, self.settings.get("card_columns"))]
+        by_tab = self.settings.get("item_columns_by_tab", {})
+        pairs += [(info["tree"], by_tab.get(str(tab))) for tab, info in self.item_tabs.items()]
+        for tree, saved in pairs:
             if not isinstance(saved, dict):
                 continue
             for name in ("checked", "name", "count", "maximum"):
@@ -1851,32 +1365,81 @@ class TrainerApp(tk.Tk):
                     tree.column(name, width=width)
 
     def schedule_save_column_widths(self, _event=None):
+        if self._closing:
+            return
         if self._column_save_timer_id is not None:
             self.after_cancel(self._column_save_timer_id)
-        self._column_save_timer_id = self.after(300, self.save_column_widths)
+        self._column_save_timer_id = self.after(350, self.save_column_widths)
+
+    def _capture_columns(self):
+        def widths(tree):
+            return {name: int(tree.column(name, "width")) for name in ("checked", "name", "count", "maximum")}
+        self.settings["card_columns"] = widths(self.card_tree)
+        self.settings["item_columns_by_tab"] = {str(tab): widths(info["tree"]) for tab, info in self.item_tabs.items()}
 
     def save_column_widths(self):
         self._column_save_timer_id = None
-        changed = False
-        pairs = [(self.card_tree, "card_columns")]
-        pairs += [(self.item_tabs[tab]["tree"], "item_columns") for tab in sorted(self.item_tabs)]
-        for tree, key in pairs:
-            widths = {
-                name: int(tree.column(name, "width"))
-                for name in ("checked", "name", "count", "maximum")
-            }
-            if widths != self.settings.get(key):
-                self.settings[key] = widths
-                changed = True
-        if not changed:
-            return
+        self._capture_columns()
+        self._persist_settings()
+
+    def _persist_settings(self):
         try:
-            SETTINGS_FILE.write_text(
-                json.dumps(self.settings, ensure_ascii=False, indent=2),
-                encoding="utf-8",
-            )
-        except OSError:
-            pass
+            self.settings_store.save(dict(self.settings))
+        except Exception as exc:
+            self.status_var.set(f"设置保存失败：{exc}")
+            return False
+        return True
+
+    def _restore_window(self):
+        saved = self.settings.get("window_geometry", "")
+        match = re.fullmatch(r"(\d+)x(\d+)([+-]\d+)([+-]\d+)", saved) if isinstance(saved, str) else None
+        if match:
+            width, height, x, y = map(int, match.groups())
+            screen_width, screen_height = self.winfo_screenwidth(), self.winfo_screenheight()
+            width = max(640, min(width, screen_width))
+            height = max(480, min(height, screen_height))
+            x = max(0, min(x, screen_width - width))
+            y = max(0, min(y, screen_height - height))
+            self.geometry(f"{width}x{height}+{x}+{y}")
+            self._normal_geometry = f"{width}x{height}+{x}+{y}"
+        self._geometry_ready = False
+        self._last_window_state = "zoomed" if self.settings.get("window_maximized", False) else "normal"
+        if self._last_window_state == "zoomed":
+            self.state_window("zoomed")
+        self._geometry_enable_timer_id = self.after(800, self._enable_geometry_tracking)
+
+    def state_window(self, value=None):
+        return super().state(value) if value is not None else super().state()
+
+    def _enable_geometry_tracking(self):
+        self._geometry_enable_timer_id = None
+        self._geometry_ready = True
+        self._capture_geometry()
+
+    def _window_changed(self, event):
+        if event.widget is not self or self._closing or not getattr(self, "_geometry_ready", False):
+            return
+        current = self.state_window()
+        if current not in ("normal", "zoomed"):
+            return
+        self._capture_geometry()
+        if self._geometry_timer_id is not None:
+            self.after_cancel(self._geometry_timer_id)
+        self._geometry_timer_id = self.after(600, self._save_geometry)
+
+    def _capture_geometry(self):
+        current = self.state_window()
+        if current == "normal":
+            self._normal_geometry = self.geometry()
+        self.settings["window_geometry"] = self._normal_geometry
+        if current in ("normal", "zoomed"):
+            self._last_window_state = current
+        self.settings["window_maximized"] = self._last_window_state == "zoomed"
+
+    def _save_geometry(self):
+        self._geometry_timer_id = None
+        self._capture_geometry()
+        self._persist_settings()
 
     def display_name(self, name, fallback="未命名船员"):
         cleaned = "".join(char for char in name if char.isprintable()).strip()
@@ -1888,6 +1451,8 @@ class TrainerApp(tk.Tk):
             self.load_crew_form()
 
     def load_crew_form(self):
+        if not self.state or not self.state["crews"]:
+            return
         crew = self.state["crews"][self.selected_crew]
         for key in self.crew_vars:
             self.crew_vars[key].set(str(crew[key]))
@@ -1939,10 +1504,8 @@ class TrainerApp(tk.Tk):
             return
         try:
             changes = {key: self.parse_number(self.resource_vars[key].get(), label) for key, label in RESOURCE_FIELDS}
-            changes["crews"] = []
-            result = self.game.apply_changes(changes)
-            self.update_state(result)
-            self.status_var.set("基础资源已写入并回读校验成功；存档备份位于 backups 目录")
+            self._write("资源应用", lambda game: game.apply_changes(changes), "resources",
+                        f"基础资源已写入并完成回读；备份目录：{self.settings.get('backup_root', DEFAULT_BACKUP_ROOT)}")
         except Exception as exc:
             self.status_var.set("资源应用失败")
             messagebox.showerror("资源应用失败", str(exc), parent=self)
@@ -1968,20 +1531,9 @@ class TrainerApp(tk.Tk):
             messagebox.showerror("无法应用", "没有可编辑的船员，请先刷新", parent=self)
             return
         try:
-            changes = {key: self.state[key] for key in ("money", "food", "medals", "stamina")}
-            crew = {"index": self.selected_crew, "restoreBattle": True}
-            for key, var in self.crew_vars.items():
-                crew[key] = self.parse_number(var.get(), key)
-            crew["params"] = [self.parse_number(var.get(), f"基础{PARAM_NAMES[i]}") for i, var in enumerate(self.param_vars)]
-            crew["addParams"] = [self.parse_number(var.get(), f"成长{PARAM_NAMES[i]}") for i, var in enumerate(self.add_param_vars)]
-            self.check_crew_param_limits(crew)
-            changes["crews"] = [crew]
-            result = self.game.apply_changes(changes)
-            self.update_state(result)
-            restored = result["crews"][self.selected_crew]
-            self.status_var.set(
-                f"已将战斗 HP 恢复为 {restored['battleHP']}、战斗 SP 恢复为 {restored['battleSP']}（当前计算上限）"
-            )
+            crew = {"index": self.state["crews"][self.selected_crew]["index"], "restoreBattle": True}
+            self._write("恢复战斗 HP/SP", lambda game: game.apply_changes({"crews": [crew]}), "crews",
+                        "已按游戏当前计算上限恢复战斗 HP/SP", fields="battle")
         except Exception as exc:
             self.status_var.set("恢复失败")
             messagebox.showerror("恢复失败", str(exc), parent=self)
@@ -2001,29 +1553,41 @@ class TrainerApp(tk.Tk):
             messagebox.showerror("无法应用", "没有可编辑的船员，请先刷新", parent=self)
             return
         try:
-            changes = {key: self.state[key] for key in ("money", "food", "medals", "stamina")}
-            crew = {"index": self.selected_crew}
+            changes = {}
+            crew = {"index": self.state["crews"][self.selected_crew]["index"]}
             for key, var in self.crew_vars.items():
                 crew[key] = self.parse_number(var.get(), key)
             crew["params"] = [self.parse_number(var.get(), f"基础{PARAM_NAMES[i]}") for i, var in enumerate(self.param_vars)]
             crew["addParams"] = [self.parse_number(var.get(), f"成长{PARAM_NAMES[i]}") for i, var in enumerate(self.add_param_vars)]
             self.check_crew_param_limits(crew)
             changes["crews"] = [crew]
-            result = self.game.apply_changes(changes)
-            self.update_state(result)
-            self.status_var.set("船员属性已写入并回读校验成功；存档备份位于 backups 目录")
+            self._write("船员应用", lambda game: game.apply_changes(changes), "crews",
+                        f"船员属性已写入并完成回读；备份目录：{self.settings.get('backup_root', DEFAULT_BACKUP_ROOT)}")
         except Exception as exc:
             self.status_var.set("船员应用失败")
             messagebox.showerror("船员应用失败", str(exc), parent=self)
 
     def on_close(self):
+        if self._closing:
+            return
+        for timer in (self._column_save_timer_id, self._geometry_timer_id, self._geometry_enable_timer_id, self._auto_connect_timer_id):
+            if timer is not None:
+                self.after_cancel(timer)
+        self._column_save_timer_id = None
+        self._geometry_timer_id = None
+        self._geometry_enable_timer_id = None
+        self._auto_connect_timer_id = None
+        self._capture_geometry()
+        self._capture_columns()
+        if not self._persist_settings():
+            if not messagebox.askyesno("设置保存失败", "设置未能保存，仍然关闭修改器？", parent=self):
+                return
+        self._closing = True
         self._stop_lock_remaining()
-        if self._column_save_timer_id is not None:
-            self.after_cancel(self._column_save_timer_id)
-            self._column_save_timer_id = None
-        self.save_column_widths()
-        self.game.close()
-        self.destroy()
+        self.lock_remaining_var.set(False)
+        self._set_controls_busy(True)
+        self.status_var.set("正在等待当前任务完成并安全断开游戏……")
+        self.worker.jobs.put(None)
 
 
 if __name__ == "__main__":
