@@ -5,19 +5,22 @@ from pathlib import Path
 import re
 import tempfile
 
+from game_paths import detect_game_root
+
 
 DEFAULT_BACKUP_ROOT = Path(__file__).resolve().parent / "backups"
 DEFAULT_SETTINGS_FILE = Path(__file__).resolve().parent / "trainer_settings.json"
 DEFAULT_LOCK_INTERVAL_MS = 700
-_GAME_ROOT = Path(r"E:\SteamLibrary\steamapps\common\High Sea Saga DX")
 _GEOMETRY_PATTERN = re.compile(r"[1-9]\d*x[1-9]\d*(?:[+-]\d+[+-]\d+)?")
 
 
 def _protect_game_directory(path):
     resolved = path.expanduser().resolve()
-    game_root = _GAME_ROOT.resolve()
-    if resolved == game_root or game_root in resolved.parents:
-        raise ValueError("禁止向游戏安装目录写入文件，请选择游戏目录之外的位置")
+    game_root = detect_game_root()
+    if game_root is not None:
+        game_root = game_root.resolve()
+        if resolved == game_root or game_root in resolved.parents:
+            raise ValueError("禁止向游戏安装目录写入文件，请选择游戏目录之外的位置")
     return resolved
 
 

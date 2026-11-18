@@ -18,6 +18,12 @@
 - 直接运行 `python trainer.py` 使用当前命令行的 Python 环境，需自行安装 `frida==17.26.3`。
 - `启动修改器.bat` 首次准备环境时要求 `%LOCALAPPDATA%\Programs\Python\Python312\python.exe` 处已安装 Python 3.12，且 `uv` 可从命令行调用；脚本使用 `uv venv` 创建本地 `.venv`，再用 `uv pip` 安装 `frida==17.26.3`。准备完成后使用 `.venv\Scripts\pythonw.exe` 启动修改器。
 - Steam 版《High Sea Saga DX》，运行进程为 `KairoGames.exe`。
+- 修改器从 Steam 注册表与 `steamapps\libraryfolders.vdf` 自动定位游戏安装目录，并备份其下的 `saves`。非标准安装可用环境变量覆盖：`HSSDX_GAME_ROOT` 指向安装目录，`HSSDX_GAME_SAVES` 直接指向存档目录。例如 PowerShell：
+
+  ```powershell
+  $env:HSSDX_GAME_ROOT = 'D:\Games\High Sea Saga DX'
+  python trainer.py
+  ```
 
 先启动游戏并载入目标存档，再执行：
 
@@ -74,7 +80,7 @@ python trainer.py
 
 请确认备份位置有足够空间与写入权限。备份失败时应先处理错误，再执行修改。备份是磁盘存档副本，不是当前内存状态快照，尚未由游戏保存的修改不会因此自动落盘。
 
-**禁止向游戏安装目录 `E:\SteamLibrary\steamapps\common\High Sea Saga DX` 写入文件或文件夹。** 修改器设置文件、备份和临时文件应位于该目录之外。程序不提供自动恢复存档功能；请保留备份原件，恢复前先退出游戏并自行核对操作范围。
+**禁止向游戏安装目录写入文件或文件夹。** 修改器会自动识别 Steam 库中的安装目录，拒绝把备份位置设为该目录及其子目录；也可用 `HSSDX_GAME_ROOT` 显式指定安装目录。无法识别安装目录时不会阻止保存，需自行确认设置文件、备份和临时文件位于游戏目录之外。程序不提供自动恢复存档功能；请保留备份原件，恢复前先退出游戏并自行核对操作范围。
 
 ## 模块结构
 
@@ -82,20 +88,21 @@ python trainer.py
 HighSeaSagaDXTrainer/
 ├── trainer.py              # tkinter 界面、串行后台任务与范围刷新
 ├── game_backend.py         # Frida 脚本、游戏读写、连接事件与会话备份
+├── game_paths.py           # 定位游戏安装目录与存档目录
 ├── app_settings.py         # 设置默认值、校验、兼容迁移与原子保存
 ├── trainer_settings.json   # 本地配置：备份位置、锁定、连接、窗口与列宽
 ├── 启动修改器.bat          # Windows 启动入口
-├── AGENT.md                # 项目目录保护约束
 └── backups/                # 默认备份位置，首次备份时创建
 ```
 
-`app_settings.py` 仅依赖 Python 标准库，不导入游戏后端。公共接口为：
+`app_settings.py` 与 `game_paths.py` 仅依赖 Python 标准库，不导入 Frida 或游戏后端。公共接口为：
 
 - `DEFAULT_BACKUP_ROOT`、`DEFAULT_SETTINGS_FILE`：默认路径，类型为 `Path`。
 - `DEFAULT_LOCK_INTERVAL_MS = 700`。
 - `validate_backup_root(value)`：返回校验后的绝对 `Path`；无效路径或受保护目录抛出异常，不创建目录。
 - `SettingsStore(path=DEFAULT_SETTINGS_FILE).load()`：返回包含默认值及兼容迁移结果的字典。
 - `SettingsStore(...).save(data)`：校验并原子保存；错误交由调用方处理。
+- `detect_game_root()`、`game_saves()`：返回自动识别的安装目录与存档目录，无法识别时返回 `None`；均可用环境变量覆盖。
 
 配置键为 `backup_root`、`lock_interval_ms`、`auto_connect`、可选的 `window_geometry` / `window_maximized`、`item_columns_by_tab`（`"0"`、`"1"`、`"2"`）与 `card_columns`。
 
@@ -108,6 +115,7 @@ HighSeaSagaDXTrainer/
 | 数值修改后又变化 | 检查游戏自身的结算、锁定状态及写入/回读提示，先刷新确认，避免盲目重复写入。 |
 | 双六目标格未生效 | 先进入双六屋初始化棋盘，并确认目标格在当前位置之后。 |
 | 备份位置被拒绝 | 选择游戏安装目录之外的目录，检查是否通过链接指向受保护位置，以及路径中是否含有同名文件。 |
+| 备份提示未找到游戏安装目录或存档目录 | 非标准安装或非默认 Steam 库：设置 `HSSDX_GAME_ROOT` 或 `HSSDX_GAME_SAVES` 指向实际位置。 |
 | 窗口设置未恢复 | 配置缺失或对应字段无效时使用默认值；检查配置位置与写入权限。 |
 
 ## 使用范围

@@ -1,16 +1,14 @@
 import shutil
 from datetime import datetime
-from pathlib import Path
 from queue import Empty, SimpleQueue
 from threading import Lock
 
 import frida
 
 from app_settings import DEFAULT_BACKUP_ROOT, validate_backup_root
+from game_paths import GAME_ROOT_ENV, game_saves
 
 GAME_NAME = "KairoGames.exe"
-GAME_SAVES = Path(r"E:\SteamLibrary\steamapps\common\High Sea Saga DX\saves")
-BACKUP_ROOT = DEFAULT_BACKUP_ROOT
 PARAM_NAMES = ["HP", "SP", "攻击", "防御", "速度", "智慧"]
 PARAM_SUM_LIMIT = 2_000_000_000
 # 探索/战斗中攻/防/速会再乘"属性相性"(100±affinity)/100，HP/SP/速度会被技能按百分比放大，
@@ -1115,11 +1113,17 @@ class IL2CPPGame:
 
     def _copy_backup(self, root):
         root = validate_backup_root(root)
-        if not GAME_SAVES.is_dir():
-            raise RuntimeError(f"找不到存档目录：{GAME_SAVES}")
+        saves = game_saves()
+        if saves is None:
+            raise RuntimeError(
+                "未找到游戏安装目录，请设置环境变量 "
+                f"{GAME_ROOT_ENV} 指向《High Sea Saga DX》安装目录"
+            )
+        if not saves.is_dir():
+            raise RuntimeError(f"找不到存档目录：{saves}")
         destination = root / datetime.now().strftime("%Y%m%d-%H%M%S-%f") / "saves"
         destination.parent.mkdir(parents=True, exist_ok=False)
-        shutil.copytree(GAME_SAVES, destination)
+        shutil.copytree(saves, destination)
         return destination
 
     def backup_saves(self):
