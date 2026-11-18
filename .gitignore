@@ -6,6 +6,7 @@ __pycache__/
 
 # 本地配置
 AGENT.md
+trainer_settings.json
 
 # 备份文件（本地生成，不需提交）
 backups/
