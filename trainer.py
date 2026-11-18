@@ -341,14 +341,17 @@ class TrainerApp(tk.Tk):
         self._reset_connection()
         self.status_var.set("已断开游戏")
 
-    def _write(self, title, operation, scope, message, fields=None, written=None):
+    def _write(self, title, operation, scope, message, fields=None, written=None, crew_index=None):
         def run(game):
             result = operation(game)
             try:
                 if scope == "resources":
                     data = game.read_resources()
-                elif scope == "crews":
-                    data = game.read_crews()
+                elif scope == "crew":
+                    if fields == "battle":
+                        data = game.read_crew_battle(crew_index)
+                    else:
+                        data = game.read_crew(crew_index)
                 elif isinstance(scope, int):
                     data = game.read_items(scope)
                 else:
@@ -371,17 +374,14 @@ class TrainerApp(tk.Tk):
                 self.state.update(data)
                 for key, var in self.resource_vars.items():
                     var.set(str(data[key]))
-            elif scope == "crews":
-                self.state["crews"] = data
-                self._update_crew_choices()
-                if not data:
-                    for var in list(self.crew_vars.values()) + self.param_vars + self.add_param_vars:
-                        var.set("")
-                elif fields == "battle":
-                    crew = data[self.selected_crew]
+            elif scope == "crew":
+                if fields == "battle":
+                    self.state["crews"][crew_index].update(data)
                     for key in ("battleHP", "battleSP"):
-                        self.crew_vars[key].set(str(crew[key]))
+                        self.crew_vars[key].set(str(data[key]))
                 else:
+                    self.state["crews"][crew_index] = data
+                    self._update_crew_choices()
                     self.load_crew_form()
             elif isinstance(scope, int):
                 self.state["itemsByTab"][scope] = data
@@ -1532,8 +1532,8 @@ class TrainerApp(tk.Tk):
             return
         try:
             crew = {"index": self.state["crews"][self.selected_crew]["index"], "restoreBattle": True}
-            self._write("恢复战斗 HP/SP", lambda game: game.apply_changes({"crews": [crew]}), "crews",
-                        "已按游戏当前计算上限恢复战斗 HP/SP", fields="battle")
+            self._write("恢复战斗 HP/SP", lambda game: game.apply_changes({"crews": [crew]}), "crew",
+                        "已按游戏当前计算上限恢复战斗 HP/SP", fields="battle", crew_index=crew["index"])
         except Exception as exc:
             self.status_var.set("恢复失败")
             messagebox.showerror("恢复失败", str(exc), parent=self)
@@ -1561,8 +1561,9 @@ class TrainerApp(tk.Tk):
             crew["addParams"] = [self.parse_number(var.get(), f"成长{PARAM_NAMES[i]}") for i, var in enumerate(self.add_param_vars)]
             self.check_crew_param_limits(crew)
             changes["crews"] = [crew]
-            self._write("船员应用", lambda game: game.apply_changes(changes), "crews",
-                        f"船员属性已写入并完成回读；备份目录：{self.settings.get('backup_root', DEFAULT_BACKUP_ROOT)}")
+            self._write("船员应用", lambda game: game.apply_changes(changes), "crew",
+                        f"船员属性已写入并完成回读；备份目录：{self.settings.get('backup_root', DEFAULT_BACKUP_ROOT)}",
+                        crew_index=crew["index"])
         except Exception as exc:
             self.status_var.set("船员应用失败")
             messagebox.showerror("船员应用失败", str(exc), parent=self)

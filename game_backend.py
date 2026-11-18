@@ -506,7 +506,11 @@ function crewObjects(currentPlayer) {
       } else if (klass !== characterClass.toString() && klass !== crewClass.toString()) {
         continue;
       }
-      if (crew.isNull() || seen.has(crew.toString())) continue;
+      if (crew.isNull()) continue;
+      // Human.crew_ 也可能指向 Monster；解包后必须重新校验，不能按船员布局读取。
+      const resolvedClass = api.objectClass(crew).toString();
+      if (resolvedClass !== characterClass.toString() && resolvedClass !== crewClass.toString()) continue;
+      if (seen.has(crew.toString())) continue;
       seen.add(crew.toString());
       result.push(crew);
     }
@@ -715,6 +719,23 @@ function readResources() {
     stamina: readSecure(staminaWrapper(currentPlayer, 2))
   };
 }
+function crewAt(index) {
+  if (!Number.isInteger(index) || index < 0) throw new Error('船员索引无效');
+  const crews = crewObjects(player());
+  if (index >= crews.length) throw new Error('船员列表已变化，请刷新后重试');
+  return crews[index];
+}
+function readCrewAt(index) {
+  return readCrew(crewAt(index), index);
+}
+function readCrewBattleAt(index) {
+  const crew = crewAt(index);
+  return {
+    index,
+    battleHP: crew.add(battleHPOffset).readS32(),
+    battleSP: crew.add(battleSPOffset).readS32()
+  };
+}
 function readCrews() {
   return crewObjects(player()).map(readCrew);
 }
@@ -911,6 +932,8 @@ function writeSugorokuRemaining(value) {
 }
 rpc.exports = {
   readResources,
+  readCrewAt,
+  readCrewBattleAt,
   readCrews,
   readItems,
   readSugoroku() { return readSugoroku(player()); },
@@ -1033,6 +1056,12 @@ class IL2CPPGame:
 
     def read_resources(self):
         return self._exports().read_resources()
+
+    def read_crew(self, index):
+        return self._exports().read_crew_at(index)
+
+    def read_crew_battle(self, index):
+        return self._exports().read_crew_battle_at(index)
 
     def read_crews(self):
         return self._exports().read_crews()
