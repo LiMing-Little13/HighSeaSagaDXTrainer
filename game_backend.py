@@ -19,6 +19,11 @@ PARAM_SAFE_LIMITED = ("HP", "SP", "攻击", "防御", "速度")
 PARAM_ONECLICK_BASE = 10_000
 PARAM_ONECLICK_GROWTH = PARAM_SAFE_TOTAL - PARAM_ONECLICK_BASE
 RESOURCE_FIELDS = (("money", "金钱"), ("food", "食物/资源"), ("medals", "奖牌"), ("stamina", "当前体力"))
+# 游戏存档时会校验全部资源数值：金钱写满 20 亿后，游戏内收入结算继续加钱会把它推过游戏上限，
+# 之后游戏拒绝保存整个存档（与本次修改哪个字段无关）。金钱输入上限留 1 亿余量避开这个失败模式；
+# 读取侧仍以 20 亿为安全阈值检测异常（含 32 位溢出成负数）。
+RESOURCE_SAFE_MAX = 2_000_000_000
+RESOURCE_INPUT_MAX = {"money": 1_900_000_000, "food": 2_000_000_000, "medals": 2_000_000_000, "stamina": 2_000_000_000}
 
 IL2CPP_SCRIPT = r"""
 const game = Process.getModuleByName('GameAssembly.dll');
@@ -770,7 +775,9 @@ function applyChanges(changes) {
   const crews = crewChanges.length ? crewObjects(currentPlayer) : [];
   const resourceKeys = ['money', 'food', 'medals', 'stamina'].filter(key =>
     Object.prototype.hasOwnProperty.call(changes, key));
-  for (const key of resourceKeys) checkInteger(changes[key], key);
+  // 与 Python 侧 RESOURCE_INPUT_MAX 保持一致：金钱留 1 亿余量，防止游戏收入结算推爆后无法存档。
+  const RESOURCE_LIMITS = {money: 1900000000, food: 2000000000, medals: 2000000000, stamina: 2000000000};
+  for (const key of resourceKeys) checkInteger(changes[key], key, RESOURCE_LIMITS[key]);
   const PARAM_NAME_TABLE = ['HP', 'SP', '攻击', '防御', '速度', '智慧'];
   const PARAM_SAFE_TOTAL = 9990000;
   const PARAM_SAFE_LIMITED = ['HP', 'SP', '攻击', '防御', '速度'];

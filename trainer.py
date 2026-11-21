@@ -13,6 +13,7 @@ from app_settings import (
 from game_backend import (
     IL2CPPGame, GAME_NAME, PARAM_NAMES, PARAM_SUM_LIMIT, PARAM_SAFE_TOTAL,
     PARAM_SAFE_LIMITED, PARAM_ONECLICK_BASE, PARAM_ONECLICK_GROWTH, RESOURCE_FIELDS,
+    RESOURCE_INPUT_MAX, RESOURCE_SAFE_MAX,
 )
 
 
@@ -172,6 +173,7 @@ class TrainerApp(tk.Tk):
         self.status_var = tk.StringVar(value="正在准备连接游戏……")
         self.summary_var = tk.StringVar(value="尚未读取数据")
         self.resource_vars = {name: tk.StringVar() for name, _label in RESOURCE_FIELDS}
+        self.resource_warn_var = tk.StringVar()
         self.crew_choice_var = tk.StringVar()
         self.crew_vars = {
             name: tk.StringVar()
@@ -205,6 +207,12 @@ class TrainerApp(tk.Tk):
         self._lock_timer_id = None
         self._lock_target_value = 0
         self._lock_failures = 0
+        self.resource_lock_vars = {name: tk.BooleanVar(value=False) for name, _label in RESOURCE_FIELDS}
+        self._resource_lock_targets = {}
+        self._resource_lock_timer_id = None
+        self._resource_lock_failures = 0
+        self.resource_entries = {}
+        self._resource_labels = dict(RESOURCE_FIELDS)
         self._column_save_timer_id = None
         self.backup_root_var = tk.StringVar(value=self.settings.get("backup_root", str(DEFAULT_BACKUP_ROOT)))
         self.backup_hint_var = tk.StringVar(value=f"存档备份目录：{self.backup_root_var.get()}")
@@ -227,7 +235,7 @@ class TrainerApp(tk.Tk):
         else:
             self.status_var.set("请启动游戏并载入存档后连接")
 
-    def _submit(self, title, operation, success=None, failure=None, quiet=False, require_connection=True):
+    def _submit(self, title, operation, success=None, failure=None, quiet=False, require_connection=True, background=False):
         if self._closing or self._close_failed:
             return False
         if self._busy is not None:
@@ -239,10 +247,13 @@ class TrainerApp(tk.Tk):
                 self.status_var.set("请先连接游戏")
             return False
         self._job_serial += 1
-        self._busy = title
-        self._callbacks[self._job_serial] = (title, success, failure, quiet)
+        # 后台轮询不占用前台“忙碌”标记：否则每 700ms 一次的锁定检查会挡住用户点击应用。
+        if not background:
+            self._busy = title
+        self._callbacks[self._job_serial] = (title, success, failure, quiet, background)
         self.worker.jobs.put((self._job_serial, operation))
-        self._set_controls_busy(True)
+        if not background:
+            self._set_controls_busy(True)
         if not quiet:
             self.status_var.set(f"正在{title}……")
         return True
@@ -272,6 +283,7 @@ class TrainerApp(tk.Tk):
                 self._closing = False
                 self._stop_lock_remaining()
                 self.lock_remaining_var.set(False)
+                self._stop_resource_lock()
                 self._set_controls_busy(True)
                 self.status_var.set("关闭失败：后端引用已保留，已停止次数锁定；请再次关闭窗口以重试")
                 messagebox.showerror("关闭失败", f"{payload}\n\n尚未确认释放游戏连接，已阻止新连接和写入。\n请再次关闭窗口以重试。", parent=self)
@@ -286,11 +298,13 @@ class TrainerApp(tk.Tk):
                     self.status_var.set(payload.get("message", ""))
                 continue
             token, value, error = payload
-            title, success, failure, quiet = self._callbacks.pop(token)
-            self._busy = None
+            title, success, failure, quiet, background = self._callbacks.pop(token)
+            if not background:
+                self._busy = None
             if self._closing:
                 continue
-            self._set_controls_busy(False)
+            if not background:
+                self._set_controls_busy(False)
             if error is not None:
                 if failure:
                     failure(error)
@@ -307,11 +321,16 @@ class TrainerApp(tk.Tk):
         self.lock_remaining_var.set(False)
         self.lock_step_var.set(False)
         self._lock_target_value = 0
+        self._stop_resource_lock()
+        self._resource_lock_targets.clear()
+        for var in self.resource_lock_vars.values():
+            var.set(False)
         self.state = None
         self.process_var.set("未连接")
         self.summary_var.set("尚未读取数据")
         for var in self.resource_vars.values():
             var.set("")
+        self.resource_warn_var.set("")
         for var in list(self.crew_vars.values()) + self.param_vars + self.add_param_vars:
             var.set("")
         self.crew_selector.configure(values=())
@@ -333,6 +352,8 @@ class TrainerApp(tk.Tk):
 
     def disconnect(self):
         if self._busy is not None or self._closing:
+            if self._busy is not None:
+                self.status_var.set(f"正在{self._busy}，请等待完成")
             return
         self._stop_lock_remaining()
         self._submit("断开游戏", lambda game: game.close(), lambda _value: self._disconnected(), require_connection=False)
@@ -372,8 +393,11 @@ class TrainerApp(tk.Tk):
                 return
             if scope == "resources":
                 self.state.update(data)
+                # 只回填本次实际写入的字段，避免把用户正在编辑或尚未提交的其它资源输入覆盖掉。
                 for key, var in self.resource_vars.items():
-                    var.set(str(data[key]))
+                    if fields is None or key in fields:
+                        var.set(str(data[key]))
+                self._update_resource_warning()
             elif scope == "crew":
                 if fields == "battle":
                     self.state["crews"][crew_index].update(data)
@@ -457,6 +481,7 @@ class TrainerApp(tk.Tk):
         )
         style.configure("Heading.TLabel", font=self.font_heading, foreground="#1769aa")
         style.configure("Hint.TLabel", foreground="#6b7280")
+        style.configure("Warn.TLabel", foreground="#c62828")
         style.configure("Big.TLabel", font=self.font_big, foreground="#1769aa")
         style.configure("Status.Info.TLabel", foreground="#1769aa", background="#e8edf2")
         style.configure("Status.Ok.TLabel", foreground="#2e7d32", background="#e6f0e6")
@@ -513,15 +538,28 @@ class TrainerApp(tk.Tk):
         resources.columnconfigure(1, weight=1)
         for row, (key, label) in enumerate(RESOURCE_FIELDS):
             ttk.Label(resources, text=label).grid(row=row, column=0, padx=(0, 12), pady=5, sticky="w")
-            ttk.Entry(resources, textvariable=self.resource_vars[key], width=22).grid(row=row, column=1, pady=5, sticky="ew")
-        ttk.Label(resources, text="体力修改的是当前体力，不修改体力上限", style="Hint.TLabel").grid(
+            entry = ttk.Entry(resources, textvariable=self.resource_vars[key], width=22)
+            entry.grid(row=row, column=1, pady=5, sticky="ew")
+            self.resource_entries[key] = entry
+            ttk.Checkbutton(
+                resources,
+                text="锁定",
+                variable=self.resource_lock_vars[key],
+                command=lambda k=key: self.toggle_resource_lock(k),
+            ).grid(row=row, column=2, padx=(12, 0), pady=5, sticky="w")
+        ttk.Label(
+            resources,
+            text="体力修改的是当前体力，不修改体力上限；金钱输入上限 19 亿，给游戏收入结算留余量——写满 20 亿后游戏继续加钱会导致无法存档",
+            style="Hint.TLabel",
+        ).grid(
             row=len(RESOURCE_FIELDS), column=0, columnspan=2, pady=(8, 0), sticky="w"
         )
         resource_actions = ttk.Frame(resources)
         resource_actions.grid(row=len(RESOURCE_FIELDS) + 1, column=0, columnspan=2, sticky="ew", pady=(10, 0))
         resource_actions.columnconfigure(0, weight=1)
         ttk.Button(resource_actions, text="应用资源修改", style="Accent.TButton", command=self.apply_resources).grid(row=0, column=0, sticky="w")
-        ttk.Label(resource_actions, text="仅修改本页四项基础资源；首次写入前自动备份存档", style="Hint.TLabel").grid(row=1, column=0, sticky="ew", pady=(6, 0))
+        ttk.Label(resource_actions, text="仅修改本页四项基础资源；首次写入前自动备份存档。勾选“锁定”的资源会按目标值周期性写回，游戏内消耗或获得都会被改回；锁定期间资源可直接编辑，编辑值自动成为新目标", style="Hint.TLabel").grid(row=1, column=0, sticky="ew", pady=(6, 0))
+        ttk.Label(resource_actions, textvariable=self.resource_warn_var, style="Warn.TLabel").grid(row=2, column=0, sticky="ew", pady=(6, 0))
 
         summary = ttk.LabelFrame(overview_page, text="存档概况", padding=12)
         summary.grid(row=2, column=0, sticky="ew")
@@ -811,6 +849,8 @@ class TrainerApp(tk.Tk):
 
     def connect(self):
         if self._busy is not None or self._closing or self._close_failed:
+            if self._busy is not None and not self._closing:
+                self.status_var.set(f"正在{self._busy}，请等待完成")
             return
         self._reset_connection()
         def run(game):
@@ -841,6 +881,7 @@ class TrainerApp(tk.Tk):
         self.state = state
         for key in self.resource_vars:
             self.resource_vars[key].set(str(state[key]))
+        self._update_resource_warning()
         self.update_items(dict(enumerate(state["itemsByTab"])))
         self.update_sugoroku(state["sugoroku"])
         self._update_summary()
@@ -1201,8 +1242,9 @@ class TrainerApp(tk.Tk):
                 if self.lock_remaining_var.get():
                     self._lock_target_value = value
                     self._lock_failures = 0
-            self._write("次数修改", lambda game: game.apply_sugoroku({"remaining": value}), "sugoroku",
-                        f"已将剩余投掷次数设为 {value}，并完成范围回读", fields="remaining", written=written)
+            if not self._write("次数修改", lambda game: game.apply_sugoroku({"remaining": value}), "sugoroku",
+                               f"已将剩余投掷次数设为 {value}，并完成范围回读", fields="remaining", written=written):
+                self.status_var.set("操作被占用，请稍后重试")
         except Exception as exc:
             messagebox.showerror("次数修改失败", str(exc), parent=self)
 
@@ -1283,7 +1325,7 @@ class TrainerApp(tk.Tk):
                 self.status_var.set("锁定已停止：连续读取或写入失败，请进入游戏并刷新数值")
             else:
                 self._schedule_lock()
-        self._submit("检查次数锁定", run, done, failed, quiet=True)
+        self._submit("检查次数锁定", run, done, failed, quiet=True, background=True)
 
     def _stop_lock_remaining(self):
         if self._lock_timer_id is not None:
@@ -1312,7 +1354,7 @@ class TrainerApp(tk.Tk):
         behavior.columnconfigure(1, weight=1)
         ttk.Label(behavior, text="锁定轮询间隔（秒）").grid(row=0, column=0, sticky="w", padx=(0, 10))
         ttk.Spinbox(behavior, from_=0.2, to=10, increment=0.1, textvariable=self.lock_interval_var, width=8).grid(row=0, column=1, sticky="ew")
-        ttk.Label(behavior, text="允许 0.2–10 秒，影响剩余投掷次数锁定的检查频率。", style="Hint.TLabel").grid(row=1, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        ttk.Label(behavior, text="允许 0.2–10 秒，影响剩余投掷次数锁定与基础资源锁定的检查频率。", style="Hint.TLabel").grid(row=1, column=0, columnspan=2, sticky="ew", pady=(8, 0))
         ttk.Checkbutton(behavior, text="启动时自动连接游戏", variable=self.auto_connect_var).grid(row=2, column=0, columnspan=2, sticky="w", pady=(10, 0))
         ttk.Button(page, text="保存设置", style="Accent.TButton", command=self.save_preferences).grid(row=2, column=0, sticky="w")
 
@@ -1347,6 +1389,8 @@ class TrainerApp(tk.Tk):
                 self.lock_interval_var.set(f"{interval / 1000:g}")
                 if self.lock_remaining_var.get():
                     self._schedule_lock()
+                if self._resource_lock_targets:
+                    self._schedule_resource_lock()
                 self.status_var.set(f"已保存设置；锁定检查间隔 {interval / 1000:g} 秒")
             self._submit("保存设置", run, done, require_connection=False)
         except Exception as exc:
@@ -1495,20 +1539,150 @@ class TrainerApp(tk.Tk):
         except ValueError as exc:
             raise ValueError(f"{label}必须是整数") from exc
         if not minimum <= number <= maximum:
-            raise ValueError(f"{label}必须在 {minimum} 到 {maximum} 之间")
+            raise ValueError(f"{label}必须在 {minimum:,} 到 {maximum:,} 之间")
         return number
 
     def apply_resources(self):
         if not self.state:
-            messagebox.showerror("无法应用", "请先刷新读取数据", parent=self)
+            self.status_var.set("请先刷新读取数据")
+            return
+        changes = {}
+        skipped = []
+        for key, label in RESOURCE_FIELDS:
+            try:
+                maximum = RESOURCE_INPUT_MAX.get(key, RESOURCE_SAFE_MAX)
+                changes[key] = self.parse_number(self.resource_vars[key].get(), label, maximum)
+            except ValueError as exc:
+                # 超输入上限或非法的项只跳过该项，不阻塞其它资源的写入；提示只进状态栏，不弹窗。
+                skipped.append(str(exc))
+        if not changes:
+            self.status_var.set("没有可写入的资源（全部已跳过）：" + "；".join(skipped))
+            return
+        def written(_result):
+            for key, value in changes.items():
+                if key in self._resource_lock_targets:
+                    self._resource_lock_targets[key] = value
+        message = f"已将 {len(changes)} 项基础资源写入并完成回读"
+        if skipped:
+            message += "；已跳过 " + "；".join(skipped)
+        if not self._write("资源应用", lambda game: game.apply_changes(changes), "resources", message,
+                           fields=tuple(changes), written=written):
+            self.status_var.set("资源应用被占用，请稍后重试")
+
+    def _update_resource_warning(self):
+        if not self.state:
+            self.resource_warn_var.set("")
+            return
+        problems = []
+        for key, label in RESOURCE_FIELDS:
+            value = self.state.get(key)
+            if not isinstance(value, int):
+                continue
+            if value < 0:
+                problems.append(f"{label}当前为 {value}（负数，可能已溢出）")
+            elif value > RESOURCE_SAFE_MAX:
+                problems.append(f"{label}当前 {value:,}，超出上限 {RESOURCE_SAFE_MAX:,}")
+        if not problems:
+            self.resource_warn_var.set("")
+            return
+        self.resource_warn_var.set(
+            "⚠ " + "；".join(problems) + "。游戏存档时校验全部数值，超限会导致无法保存，请改回上限以内再存档"
+        )
+
+    def toggle_resource_lock(self, key):
+        label = self._resource_labels[key]
+        enabled = self.resource_lock_vars[key].get()
+        if not enabled:
+            self._resource_lock_targets.pop(key, None)
+            self._schedule_resource_lock()
+            self.status_var.set(f"已停用{label}锁定")
             return
         try:
-            changes = {key: self.parse_number(self.resource_vars[key].get(), label) for key, label in RESOURCE_FIELDS}
-            self._write("资源应用", lambda game: game.apply_changes(changes), "resources",
-                        f"基础资源已写入并完成回读；备份目录：{self.settings.get('backup_root', DEFAULT_BACKUP_ROOT)}")
+            if not self.state:
+                raise ValueError("请先刷新读取数据")
+            maximum = RESOURCE_INPUT_MAX.get(key, RESOURCE_SAFE_MAX)
+            target = self.parse_number(self.resource_vars[key].get(), label, maximum)
+            def run(game):
+                return game.apply_changes({key: target})
+            def done(_result):
+                self._resource_lock_targets[key] = target
+                self._resource_lock_failures = 0
+                self.status_var.set(
+                    f"已启用{label}锁定（目标 {target}，每 {self._lock_interval() / 1000:g} 秒检查）"
+                )
+                self._schedule_resource_lock()
+            def failed(error):
+                self.resource_lock_vars[key].set(False)
+                self.status_var.set(f"启用{label}锁定失败：{error}")
+            if not self._submit(f"启用{label}锁定", run, done, failed, quiet=True):
+                self.resource_lock_vars[key].set(False)
         except Exception as exc:
-            self.status_var.set("资源应用失败")
-            messagebox.showerror("资源应用失败", str(exc), parent=self)
+            self.resource_lock_vars[key].set(False)
+            self.status_var.set(f"启用{label}锁定失败：{exc}")
+
+    def _schedule_resource_lock(self):
+        if self._resource_lock_timer_id is not None:
+            self.after_cancel(self._resource_lock_timer_id)
+            self._resource_lock_timer_id = None
+        if self._resource_lock_targets and not self._closing:
+            self._resource_lock_timer_id = self.after(self._lock_interval(), self._resource_lock_loop)
+
+    def _resource_lock_loop(self):
+        self._resource_lock_timer_id = None
+        if not self._resource_lock_targets or self._closing or not self._connected:
+            return
+        if self._busy is not None:
+            self._schedule_resource_lock()
+            return
+        targets = dict(self._resource_lock_targets)
+        # 锁定期间资源 entry 仍可编辑：用户编辑的值不再是“需要写回的差异”，而是新的目标（移动目标）。
+        for key in list(targets):
+            try:
+                edited = self.parse_number(
+                    self.resource_vars[key].get(), self._resource_labels[key],
+                    RESOURCE_INPUT_MAX.get(key, RESOURCE_SAFE_MAX),
+                )
+            except ValueError:
+                continue
+            if edited != targets[key]:
+                targets[key] = edited
+        def run(game):
+            data = game.read_resources()
+            changes = {key: value for key, value in targets.items() if data.get(key) != value}
+            if changes:
+                game.apply_changes(changes)
+                data = game.read_resources()
+            return data, targets
+        def done(payload):
+            data, targets = payload
+            for key, value in targets.items():
+                if key in self._resource_lock_targets:
+                    self._resource_lock_targets[key] = value
+            self._resource_lock_failures = 0
+            if self.state:
+                self.state.update(data)
+            # 不回写输入框：锁定轮询每 700ms 一次，若把读回值写进 Entry，会覆盖用户
+            # 正在输入的内容（包括未锁定的资源项），表现为输入被“自动刷新掉”。
+            # Entry 始终保留用户的目标值；需要读取游戏当前值时使用“刷新数值”。
+            self._update_resource_warning()
+            self._schedule_resource_lock()
+        def failed(error):
+            self._resource_lock_failures += 1
+            self.status_var.set(f"资源锁定检查失败（{self._resource_lock_failures}/3）：{error}")
+            if self._resource_lock_failures >= 3:
+                self._resource_lock_targets.clear()
+                for var in self.resource_lock_vars.values():
+                    var.set(False)
+                self.status_var.set("资源锁定已停止：连续读取或写入失败，请进入游戏并刷新数值")
+            else:
+                self._schedule_resource_lock()
+        self._submit("检查资源锁定", run, done, failed, quiet=True, background=True)
+
+    def _stop_resource_lock(self):
+        if self._resource_lock_timer_id is not None:
+            self.after_cancel(self._resource_lock_timer_id)
+            self._resource_lock_timer_id = None
+        self._resource_lock_failures = 0
 
     def check_crew_param_limits(self, crew):
         for i in range(6):
@@ -1586,6 +1760,7 @@ class TrainerApp(tk.Tk):
         self._closing = True
         self._stop_lock_remaining()
         self.lock_remaining_var.set(False)
+        self._stop_resource_lock()
         self._set_controls_busy(True)
         self.status_var.set("正在等待当前任务完成并安全断开游戏……")
         self.worker.jobs.put(None)
