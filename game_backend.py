@@ -1,3 +1,4 @@
+import json
 import shutil
 from datetime import datetime
 from queue import Empty, SimpleQueue
@@ -6,26 +7,27 @@ from threading import Lock
 import frida
 
 from app_settings import DEFAULT_BACKUP_ROOT, validate_backup_root
+from domain import (
+    PARAM_NAMES,
+    PARAM_ONECLICK_BASE,
+    PARAM_ONECLICK_GROWTH,
+    PARAM_SAFE_LIMITED,
+    PARAM_SAFE_TOTAL,
+    PARAM_SUM_LIMIT,
+    RESOURCE_FIELDS,
+    RESOURCE_INPUT_MAX,
+    RESOURCE_SAFE_MAX,
+    limits_payload,
+)
 from game_paths import GAME_ROOT_ENV, game_saves
 
 GAME_NAME = "KairoGames.exe"
-PARAM_NAMES = ["HP", "SP", "攻击", "防御", "速度", "智慧"]
-PARAM_SUM_LIMIT = 2_000_000_000
-# 探索/战斗中攻/防/速会再乘"属性相性"(100±affinity)/100，HP/SP/速度会被技能按百分比放大，
-# 两处都是 32 位乘法；合计超过约 1000 万后乘法溢出，会出现打不动怪、防御变负被秒杀、恢复异常等，
-# 直接导致探索失败。智慧只有固定加法，不受此限。
-PARAM_SAFE_TOTAL = 9_990_000
-PARAM_SAFE_LIMITED = ("HP", "SP", "攻击", "防御", "速度")
-PARAM_ONECLICK_BASE = 10_000
-PARAM_ONECLICK_GROWTH = PARAM_SAFE_TOTAL - PARAM_ONECLICK_BASE
-RESOURCE_FIELDS = (("money", "金钱"), ("food", "食物/资源"), ("medals", "奖牌"), ("stamina", "当前体力"))
-# 游戏存档时会校验全部资源数值：金钱写满 20 亿后，游戏内收入结算继续加钱会把它推过游戏上限，
-# 之后游戏拒绝保存整个存档（与本次修改哪个字段无关）。金钱输入上限留 1 亿余量避开这个失败模式；
-# 读取侧仍以 20 亿为安全阈值检测异常（含 32 位溢出成负数）。
-RESOURCE_SAFE_MAX = 2_000_000_000
-RESOURCE_INPUT_MAX = {"money": 1_900_000_000, "food": 2_000_000_000, "medals": 2_000_000_000, "stamina": 2_000_000_000}
+
+# 上限只在 domain.py 定义；这里把同一份数据注入脚本，避免 Python/JS 各写一遍。
+_LIMITS_JSON = json.dumps(limits_payload(), ensure_ascii=False, separators=(",", ":"))
 
 IL2CPP_SCRIPT = r"""
+const LIMITS = __LIMITS__;
 const game = Process.getModuleByName('GameAssembly.dll');
 const POINTER = Process.pointerSize;
 function fn(name, ret, args) {
@@ -667,7 +669,7 @@ function readItemsByTab(tab) {
 function readSugorokuCards() {
   const cards = [];
   const cardArray = app().add(sugorokuItemFieldOffset).readPointer();
-  if (cardArray.isNull()) return {cards, ready: false};
+  if (cardArray.isNull()) return {cards, cardsReady: false};
   for (let i = 0; i < api.arrayLength(cardArray); i++) {
     const card = cardArray.add(16 + i * POINTER).readPointer();
     if (card.isNull()) continue;
@@ -678,10 +680,9 @@ function readSugorokuCards() {
       maximum: invokeInt(sugorokuItemClass, card, 'GetMaxNum')
     });
   }
-  return {cards, ready: true};
+  return {cards, cardsReady: true};
 }
-function readSugoroku(currentPlayer) {
-  const cardInfo = readSugorokuCards();
+function readSugorokuStep(currentPlayer) {
   const dice = currentPlayer.add(diceFieldOffset).readPointer();
   const dicePow = dice.isNull() ? NULL : dice.add(dicePowFieldOffset).readPointer();
   const powers = [];
@@ -690,29 +691,38 @@ function readSugoroku(currentPlayer) {
     diceReady = true;
     for (let i = 0; i < api.arrayLength(dicePow); i++) powers.push(dicePow.add(16 + i * 4).readS32());
   }
-  const playNum = exIntAt(currentPlayer, sugorokuPlayNumFieldOffset, '双六次数');
-  const kairoWrapper = currentPlayer.add(kairoPointFieldOffset).readPointer();
-  let board = { ready: false };
-  try {
-    board = readBoard(currentPlayer);
-  } catch (e) {}
   return {
-    cards: cardInfo.cards,
-    cardsReady: cardInfo.ready,
     step: stepOverride !== null ? stepOverride : (diceReady ? powers[0] : 0),
     powers,
     diceReady,
     stepLocked: stepLockTotal > 0,
     stepLockTotal,
     stepLockDiceCount,
-    stepOverridePending: stepOverride !== null,
+    stepOverridePending: stepOverride !== null
+  };
+}
+function readKairoPoint(currentPlayer) {
+  const wrapper = currentPlayer.add(kairoPointFieldOffset).readPointer();
+  return {
+    kairoPoint: wrapper.isNull() ? 0 : invokeInt(exIntClass, wrapper, 'Get'),
+    kairoReady: !wrapper.isNull()
+  };
+}
+function readSugoroku(currentPlayer) {
+  const cards = readSugorokuCards();
+  const step = readSugorokuStep(currentPlayer);
+  let board = { ready: false };
+  try {
+    board = readBoard(currentPlayer);
+  } catch (e) {}
+  return {
+    ...cards,
+    ...step,
+    ...readSugorokuRemaining(currentPlayer),
+    ...readKairoPoint(currentPlayer),
     gotoTarget,
     gotoNotice,
-    board,
-    remaining: invokeInt(exIntClass, playNum, 'Get'),
-    maximum: staticInt(playerClass, 'SUGOROKU_PLAY_NUM'),
-    kairoPoint: kairoWrapper.isNull() ? 0 : invokeInt(exIntClass, kairoWrapper, 'Get'),
-    kairoReady: !kairoWrapper.isNull()
+    board
   };
 }
 function readResources() {
@@ -763,7 +773,7 @@ function writeIntArray(object, fieldOffset, values) {
     if (array.add(16 + i * 4).readS32() !== values[i]) throw new Error('属性写入后校验失败');
   }
 }
-function checkInteger(value, label, maximum = 2000000000) {
+function checkInteger(value, label, maximum = LIMITS.paramSumLimit) {
   if (!Number.isInteger(value) || value < 0 || value > maximum) {
     throw new Error(label + '必须在 0 到 ' + maximum + ' 之间');
   }
@@ -775,12 +785,12 @@ function applyChanges(changes) {
   const crews = crewChanges.length ? crewObjects(currentPlayer) : [];
   const resourceKeys = ['money', 'food', 'medals', 'stamina'].filter(key =>
     Object.prototype.hasOwnProperty.call(changes, key));
-  // 与 Python 侧 RESOURCE_INPUT_MAX 保持一致：金钱留 1 亿余量，防止游戏收入结算推爆后无法存档。
-  const RESOURCE_LIMITS = {money: 1900000000, food: 2000000000, medals: 2000000000, stamina: 2000000000};
+  // 与 Python 侧共用 domain.limits_payload() 注入的同一份配置。
+  const RESOURCE_LIMITS = LIMITS.resources;
   for (const key of resourceKeys) checkInteger(changes[key], key, RESOURCE_LIMITS[key]);
-  const PARAM_NAME_TABLE = ['HP', 'SP', '攻击', '防御', '速度', '智慧'];
-  const PARAM_SAFE_TOTAL = 9990000;
-  const PARAM_SAFE_LIMITED = ['HP', 'SP', '攻击', '防御', '速度'];
+  const PARAM_NAME_TABLE = LIMITS.paramNames;
+  const PARAM_SAFE_TOTAL = LIMITS.paramSafeTotal;
+  const PARAM_SAFE_LIMITED = LIMITS.paramSafeLimited;
   for (const change of crewChanges) {
     if (!Number.isInteger(change.index) || change.index < 0 || change.index >= crews.length) {
       throw new Error('船员列表已变化，请刷新后重试');
@@ -795,7 +805,7 @@ function applyChanges(changes) {
       checkInteger(change.params[i], PARAM_NAME_TABLE[i]);
       checkInteger(change.addParams[i], PARAM_NAME_TABLE[i]);
       const sum = change.params[i] + change.addParams[i];
-      const limit = PARAM_SAFE_LIMITED.includes(PARAM_NAME_TABLE[i]) ? PARAM_SAFE_TOTAL : 2000000000;
+      const limit = PARAM_SAFE_LIMITED.includes(PARAM_NAME_TABLE[i]) ? PARAM_SAFE_TOTAL : LIMITS.paramSumLimit;
       if (sum > limit) {
         throw new Error(PARAM_NAME_TABLE[i] + ' 的基础 ' + change.params[i] + ' 与成长 ' + change.addParams[i] +
           ' 合计 ' + sum + ' 超过 ' + limit +
@@ -874,6 +884,7 @@ function applyItemTabChanges(changes) {
   return {applied: true, tab: changes.tab, count: plans.length};
 }
 function applySugorokuChanges(changes) {
+  const currentPlayer = player();
   if (Array.isArray(changes.cards) && changes.cards.length) {
     const array = app().add(sugorokuItemFieldOffset).readPointer();
     if (array.isNull()) throw new Error('双六卡片列表尚未初始化，请进入双六屋后刷新');
@@ -892,7 +903,6 @@ function applySugorokuChanges(changes) {
     }
     for (const plan of plans) setItemNum(plan.card, plan.value);
   }
-  const currentPlayer = player();
   if (changes.step !== undefined) {
     const diceCount = changes.diceCount === undefined ? 1 : changes.diceCount;
     if (!Number.isInteger(diceCount) || diceCount < 1 || diceCount > 3) throw new Error('骰子数量必须在 1 到 3 之间');
@@ -909,9 +919,7 @@ function applySugorokuChanges(changes) {
     if (!Number.isInteger(changes.remaining) || changes.remaining < 0 || changes.remaining > maximum) {
       throw new Error('剩余投掷次数必须在 0 到 ' + maximum + ' 之间');
     }
-    const playNum = currentPlayer.add(sugorokuPlayNumFieldOffset).readPointer();
-    if (playNum.isNull()) throw new Error('双六次数尚未初始化');
-    setExInt(playNum, changes.remaining);
+    setExInt(exIntAt(currentPlayer, sugorokuPlayNumFieldOffset, '双六次数'), changes.remaining);
   }
   if (changes.kairoPoint !== undefined) {
     if (!Number.isInteger(changes.kairoPoint) || changes.kairoPoint < 0 || changes.kairoPoint > 2147483647) {
@@ -921,8 +929,7 @@ function applySugorokuChanges(changes) {
   }
   return {applied: true};
 }
-function readSugorokuRemaining() {
-  const currentPlayer = player();
+function readSugorokuRemaining(currentPlayer = player()) {
   return {
     remaining: readExInt(currentPlayer, sugorokuPlayNumFieldOffset, '双六次数'),
     maximum: staticInt(playerClass, 'SUGOROKU_PLAY_NUM')
@@ -944,6 +951,9 @@ rpc.exports = {
   readCrews,
   readItems,
   readSugoroku() { return readSugoroku(player()); },
+  readSugorokuStep() { return readSugorokuStep(player()); },
+  readSugorokuCards,
+  readKairoPoint() { return readKairoPoint(player()); },
   readState,
   applyChanges,
   applyItemTabChanges,
@@ -957,6 +967,7 @@ rpc.exports = {
   readBoardState
 };
 """
+IL2CPP_SCRIPT = IL2CPP_SCRIPT.replace("__LIMITS__", _LIMITS_JSON)
 
 
 class IL2CPPGame:
@@ -1076,11 +1087,26 @@ class IL2CPPGame:
     def read_items(self, tab):
         return self._exports().read_items(tab)
 
-    def read_sugoroku(self):
+    def read_sugoroku_snapshot(self):
         return self._exports().read_sugoroku()
 
-    def apply_changes(self, changes):
-        return self._write("apply_changes", changes)
+    def read_sugoroku_step(self):
+        return self._exports().read_sugoroku_step()
+
+    def read_sugoroku_cards(self):
+        return self._exports().read_sugoroku_cards()
+
+    def read_kairo_point(self):
+        return self._exports().read_kairo_point()
+
+    def write_resources(self, values):
+        return self._write("apply_changes", values)
+
+    def update_crew(self, crew):
+        return self._write("apply_changes", {"crews": [crew]})
+
+    def restore_crew_battle(self, index):
+        return self._write("apply_changes", {"crews": [{"index": index, "restoreBattle": True}]})
 
     def apply_tab_items(self, tab, ids, value=None, safe_max=False):
         return self._write("apply_item_tab_changes", {
@@ -1090,8 +1116,14 @@ class IL2CPPGame:
             "safeMax": safe_max,
         })
 
-    def apply_sugoroku(self, changes):
-        return self._write("apply_sugoroku_changes", changes)
+    def set_next_roll_steps(self, total, count):
+        return self._write("apply_sugoroku_changes", {"step": total, "diceCount": count})
+
+    def set_sugoroku_remaining(self, value):
+        return self._write("apply_sugoroku_changes", {"remaining": value})
+
+    def write_kairo_point(self, value):
+        return self._write("apply_sugoroku_changes", {"kairoPoint": value})
 
     def apply_cards(self, indices, value=None, safe_max=False):
         return self._write("apply_sugoroku_changes", {
@@ -1118,7 +1150,7 @@ class IL2CPPGame:
     def clear_goto_cell(self):
         return self._exports().clear_goto_cell()
 
-    def read_board(self):
+    def read_board_state(self):
         return self._exports().read_board_state()
 
     def set_backup_root(self, path):

@@ -9,12 +9,13 @@ from tkinter import filedialog, messagebox, ttk
 from app_settings import (
     DEFAULT_BACKUP_ROOT, DEFAULT_LOCK_INTERVAL_MS, SettingsStore, validate_backup_root,
 )
-
-from game_backend import (
-    IL2CPPGame, GAME_NAME, PARAM_NAMES, PARAM_SUM_LIMIT, PARAM_SAFE_TOTAL,
-    PARAM_SAFE_LIMITED, PARAM_ONECLICK_BASE, PARAM_ONECLICK_GROWTH, RESOURCE_FIELDS,
-    RESOURCE_INPUT_MAX, RESOURCE_SAFE_MAX,
+from domain import (
+    PARAM_NAMES, PARAM_ONECLICK_BASE, PARAM_ONECLICK_GROWTH,
+    PARAM_SAFE_LIMITED, PARAM_SAFE_TOTAL, PARAM_SUM_LIMIT,
+    RESOURCE_FIELDS, RESOURCE_INPUT_MAX, RESOURCE_SAFE_MAX,
 )
+
+from game_backend import GAME_NAME, IL2CPPGame
 
 
 class Tooltip:
@@ -167,8 +168,8 @@ class TrainerApp(tk.Tk):
         self._normal_geometry = f"{round(760 * dpi_scale)}x{round(680 * dpi_scale)}+0+0"
         self._scroll_pages = []
         self.worker = GameWorker(self.settings.get("backup_root", str(DEFAULT_BACKUP_ROOT)))
-        self.state = None
-        self.selected_crew = 0
+        self.snapshot = None
+        self.crew_position = 0  # 下拉框位置，不是游戏内 crew.index
         self.process_var = tk.StringVar(value="未连接")
         self.status_var = tk.StringVar(value="正在准备连接游戏……")
         self.summary_var = tk.StringVar(value="尚未读取数据")
@@ -325,7 +326,7 @@ class TrainerApp(tk.Tk):
         self._resource_lock_targets.clear()
         for var in self.resource_lock_vars.values():
             var.set(False)
-        self.state = None
+        self.snapshot = None
         self.process_var.set("未连接")
         self.summary_var.set("尚未读取数据")
         for var in self.resource_vars.values():
@@ -362,59 +363,25 @@ class TrainerApp(tk.Tk):
         self._reset_connection()
         self.status_var.set("已断开游戏")
 
-    def _write(self, title, operation, scope, message, fields=None, written=None, crew_index=None):
+    def _submit_write(self, title, *, write, read_back, apply_readback, message, on_written=None):
         def run(game):
-            result = operation(game)
+            write(game)
             try:
-                if scope == "resources":
-                    data = game.read_resources()
-                elif scope == "crew":
-                    if fields == "battle":
-                        data = game.read_crew_battle(crew_index)
-                    else:
-                        data = game.read_crew(crew_index)
-                elif isinstance(scope, int):
-                    data = game.read_items(scope)
-                else:
-                    data = game.read_sugoroku()
+                return read_back(game), None
             except Exception as exc:
-                return result, None, str(exc)
-            return result, data, None
+                return None, exc
 
         def done(payload):
-            result, data, read_error = payload
-            if written:
-                written(result)
-            if read_error:
+            data, read_error = payload
+            if on_written is not None:
+                on_written()
+            if read_error is not None:
                 self.status_var.set(f"{title}已写入，范围回读失败：{read_error}；请手动刷新确认")
                 messagebox.showwarning("写入已完成", f"写入已完成，但回读失败：{read_error}\n请勿重复提交，请先刷新确认。", parent=self)
                 return
-            if self.state is None:
-                return
-            if scope == "resources":
-                self.state.update(data)
-                # 只回填本次实际写入的字段，避免把用户正在编辑或尚未提交的其它资源输入覆盖掉。
-                for key, var in self.resource_vars.items():
-                    if fields is None or key in fields:
-                        var.set(str(data[key]))
-                self._update_resource_warning()
-            elif scope == "crew":
-                if fields == "battle":
-                    self.state["crews"][crew_index].update(data)
-                    for key in ("battleHP", "battleSP"):
-                        self.crew_vars[key].set(str(data[key]))
-                else:
-                    self.state["crews"][crew_index] = data
-                    self._update_crew_choices()
-                    self.load_crew_form()
-            elif isinstance(scope, int):
-                self.state["itemsByTab"][scope] = data
-                self.update_items({scope: data})
-            else:
-                self.state["sugoroku"] = data
-                self.update_sugoroku(data, fields=fields)
-            self._update_summary()
+            apply_readback(data)
             self.status_var.set(message)
+
         return self._submit(title, run, done)
 
     def _scroll_page(self, notebook, title, padding=10):
@@ -878,41 +845,46 @@ class TrainerApp(tk.Tk):
         self._submit("刷新全部数值", lambda game: game.read_state(), done)
 
     def update_state(self, state):
-        self.state = state
+        self.snapshot = state
         for key in self.resource_vars:
             self.resource_vars[key].set(str(state[key]))
         self._update_resource_warning()
         self.update_items(dict(enumerate(state["itemsByTab"])))
-        self.update_sugoroku(state["sugoroku"])
+        sugoroku = state["sugoroku"]
+        self._show_sugoroku_step(sugoroku)
+        self._show_sugoroku_remaining(sugoroku)
+        self._show_kairo_point(sugoroku)
+        self._update_board_ui(sugoroku.get("board") or {})
+        self._show_cards(sugoroku["cards"])
         self._update_summary()
         self._update_crew_choices()
         if state["crews"]:
             self.load_crew_form()
 
     def _update_summary(self):
-        if not self.state:
+        if not self.snapshot:
             return
-        items = self.state["itemsByTab"]
+        items = self.snapshot["itemsByTab"]
         self.summary_var.set(
-            f"{len(self.state['crews'])} 名船员  ·  武器 {len(items[0])} 件  ·  道具 {len(items[1])} 件  ·  "
-            f"强化食物 {len(items[2])} 件  ·  {len(self.state['sugoroku']['cards'])} 张双六卡片"
+            f"{len(self.snapshot['crews'])} 名船员  ·  武器 {len(items[0])} 件  ·  道具 {len(items[1])} 件  ·  "
+            f"强化食物 {len(items[2])} 件  ·  {len(self.snapshot['sugoroku']['cards'])} 张双六卡片"
         )
 
     def _update_crew_choices(self):
         choices = [
             f"{crew['index'] + 1}. {self.display_name(crew['name'])}  Lv.{crew['level']}"
-            for crew in self.state["crews"]
+            for crew in self.snapshot["crews"]
         ]
         self.crew_selector.configure(values=choices)
         if not choices:
-            self.selected_crew = 0
+            self.crew_position = 0
             self.crew_choice_var.set("当前存档没有可编辑船员")
             for var in list(self.crew_vars.values()) + self.param_vars + self.add_param_vars:
                 var.set("")
             self.crew_headroom_var.set("当前存档没有可编辑船员")
             return
-        self.selected_crew = min(self.selected_crew, len(choices) - 1)
-        self.crew_selector.current(self.selected_crew)
+        self.crew_position = min(self.crew_position, len(choices) - 1)
+        self.crew_selector.current(self.crew_position)
 
     def update_items(self, items_by_tab):
         for tab, items in items_by_tab.items():
@@ -939,7 +911,15 @@ class TrainerApp(tk.Tk):
             tree.selection_set(remaining)
             self.on_items_selected(tab)
 
-    def selected_item_indices(self, tab):
+    def _apply_items_readback(self, tab, items):
+        if self.snapshot is None:
+            return
+        self.snapshot["itemsByTab"][tab] = items
+        self.update_items({tab: items})
+        self._update_summary()
+
+    def selected_item_ids(self, tab):
+        """返回勾选的物品 id（不是列表下标）。"""
         info = self.item_tabs[tab]
         return sorted(int(iid) for iid in info["checked"] if info["tree"].exists(iid))
 
@@ -981,70 +961,88 @@ class TrainerApp(tk.Tk):
 
     def on_items_selected(self, tab):
         info = self.item_tabs[tab]
-        indices = self.selected_item_indices(tab)
-        if not indices:
+        ids = self.selected_item_ids(tab)
+        if not ids:
             info["limit_var"].set("请点击“选择”列的复选框；可勾选多个物品")
             return
-        items = {item["id"]: item for item in self.state["itemsByTab"][tab]}
-        maximum = min(items[index]["maximum"] for index in indices)
-        info["limit_var"].set(f"已勾选 {len(indices)} 项；本次可输入 0 到 {maximum}，应用时会再次实时检测")
-        if len(indices) == 1:
-            info["value_var"].set(str(items[indices[0]]["count"]))
+        items = {item["id"]: item for item in self.snapshot["itemsByTab"][tab]}
+        maximum = min(items[item_id]["maximum"] for item_id in ids)
+        info["limit_var"].set(f"已勾选 {len(ids)} 项；本次可输入 0 到 {maximum}，应用时会再次实时检测")
+        if len(ids) == 1:
+            info["value_var"].set(str(items[ids[0]]["count"]))
 
     def apply_item_value(self, tab):
-        indices = self.selected_item_indices(tab)
-        if not indices:
+        ids = self.selected_item_ids(tab)
+        if not ids:
             messagebox.showerror("无法应用", "请先勾选要修改的物品", parent=self)
             return
         try:
-            items = {item["id"]: item for item in self.state["itemsByTab"][tab]}
-            maximum = min(items[index]["maximum"] for index in indices)
+            items = {item["id"]: item for item in self.snapshot["itemsByTab"][tab]}
+            maximum = min(items[item_id]["maximum"] for item_id in ids)
             value = self.parse_number(self.item_tabs[tab]["value_var"].get(), "物品数量", maximum)
-            self._write("物品修改", lambda game: game.apply_tab_items(tab, indices, value=value), tab,
-                        f"已将 {len(indices)} 种物品数量写为 {value}，并完成本页回读")
+            self._submit_write(
+                "物品修改",
+                write=lambda game: game.apply_tab_items(tab, ids, value=value),
+                read_back=lambda game: game.read_items(tab),
+                apply_readback=lambda items: self._apply_items_readback(tab, items),
+                message=f"已将 {len(ids)} 种物品数量写为 {value}，并完成本页回读",
+            )
         except Exception as exc:
             self.status_var.set("物品修改失败")
             messagebox.showerror("物品修改失败", str(exc), parent=self)
 
     def apply_item_safe_max(self, tab):
-        indices = self.selected_item_indices(tab)
-        if not indices:
+        ids = self.selected_item_ids(tab)
+        if not ids:
             messagebox.showerror("无法应用", "请先勾选要修改的物品", parent=self)
             return
         try:
-            self._write("物品修改", lambda game: game.apply_tab_items(tab, indices, safe_max=True), tab,
-                        f"已将 {len(indices)} 种物品设为各自实时上限 - 9，并完成本页回读")
+            self._submit_write(
+                "物品修改",
+                write=lambda game: game.apply_tab_items(tab, ids, safe_max=True),
+                read_back=lambda game: game.read_items(tab),
+                apply_readback=lambda items: self._apply_items_readback(tab, items),
+                message=f"已将 {len(ids)} 种物品设为各自实时上限 - 9，并完成本页回读",
+            )
         except Exception as exc:
             self.status_var.set("物品修改失败")
             messagebox.showerror("物品修改失败", str(exc), parent=self)
 
-    def update_sugoroku(self, sugoroku, fields=None):
-        if fields in (None, "step"):
-            locked = bool(sugoroku.get("stepLocked"))
-            self.lock_step_var.set(locked)
-            if locked:
-                self.dice_count_var.set(str(sugoroku.get("stepLockDiceCount", 1)))
-                self.dice_step_var.set(str(sugoroku.get("stepLockTotal", 0)))
-            else:
-                self.dice_step_var.set(str(sugoroku.get("step", 0)))
-        if fields in (None, "remaining"):
-            self.dice_remaining_var.set(str(sugoroku["remaining"]))
-            self.dice_remaining_spinbox.configure(to=sugoroku.get("maximum", 3))
-        if fields in (None, "kairoPoint"):
-            self.kairo_point_var.set(str(sugoroku.get("kairoPoint", 0)))
-            if sugoroku.get("kairoReady", True):
-                self.kairo_point_limit_var.set("可输入 0 到 2147483647，写入时通过游戏自身的数值对象安全应用")
-            else:
-                self.kairo_point_limit_var.set("开罗点数尚未初始化，请进入正常游戏界面后刷新")
-        if fields is None:
-            self._update_board_ui(sugoroku.get("board") or {})
-        if fields not in (None, "cards"):
-            return
+    def _apply_sugoroku_readback(self, data, show):
+        if self.snapshot is not None:
+            self.snapshot["sugoroku"].update(data)
+        show(data)
+
+    def _show_sugoroku_step(self, data):
+        locked = data["stepLocked"]
+        self.lock_step_var.set(locked)
+        if locked:
+            self.dice_count_var.set(str(data["stepLockDiceCount"]))
+            self.dice_step_var.set(str(data["stepLockTotal"]))
+        else:
+            self.dice_step_var.set(str(data["step"]))
+
+    def _show_sugoroku_remaining(self, data):
+        self.dice_remaining_var.set(str(data["remaining"]))
+        self.dice_remaining_spinbox.configure(to=data["maximum"])
+
+    def _show_kairo_point(self, data):
+        self.kairo_point_var.set(str(data["kairoPoint"]))
+        if data["kairoReady"]:
+            self.kairo_point_limit_var.set("可输入 0 到 2147483647，写入时通过游戏自身的数值对象安全应用")
+        else:
+            self.kairo_point_limit_var.set("开罗点数尚未初始化，请进入正常游戏界面后刷新")
+
+    def _apply_cards_readback(self, data):
+        self._apply_sugoroku_readback(data, lambda state: self._show_cards(state["cards"]))
+        self._update_summary()
+
+    def _show_cards(self, cards):
         selected = set(self.card_tree.selection())
-        valid_ids = {str(card["index"]) for card in sugoroku["cards"]}
+        valid_ids = {str(card["index"]) for card in cards}
         self.checked_cards.intersection_update(valid_ids)
         self.card_tree.delete(*self.card_tree.get_children())
-        for card in sugoroku["cards"]:
+        for card in cards:
             iid = str(card["index"])
             self.card_tree.insert(
                 "",
@@ -1104,9 +1102,9 @@ class TrainerApp(tk.Tk):
             else:
                 self.card_limit_var.set("请点击“选择”列的复选框；可勾选多张卡片批量修改")
             return
-        if not self.state:
+        if not self.snapshot:
             return
-        cards = {card["index"]: card for card in self.state["sugoroku"]["cards"]}
+        cards = {card["index"]: card for card in self.snapshot["sugoroku"]["cards"]}
         maximum = min(cards[index]["maximum"] for index in indices)
         self.card_limit_var.set(f"已勾选 {len(indices)} 张卡片；本次可输入 0 到 {maximum}，应用时会再次实时检测")
         if len(indices) == 1:
@@ -1118,11 +1116,16 @@ class TrainerApp(tk.Tk):
             messagebox.showerror("无法应用", "请先勾选要修改的卡片", parent=self)
             return
         try:
-            cards = {card["index"]: card for card in self.state["sugoroku"]["cards"]}
+            cards = {card["index"]: card for card in self.snapshot["sugoroku"]["cards"]}
             maximum = min(cards[index]["maximum"] for index in indices)
             value = self.parse_number(self.card_value_var.get(), "卡片数量", maximum)
-            self._write("卡片修改", lambda game: game.apply_cards(indices, value=value), "sugoroku",
-                        f"已将 {len(indices)} 张卡片数量写为 {value}，并完成卡片回读", fields="cards")
+            self._submit_write(
+                "卡片修改",
+                write=lambda game: game.apply_cards(indices, value=value),
+                read_back=lambda game: game.read_sugoroku_cards(),
+                apply_readback=self._apply_cards_readback,
+                message=f"已将 {len(indices)} 张卡片数量写为 {value}，并完成卡片回读",
+            )
         except Exception as exc:
             self.status_var.set("卡片修改失败")
             messagebox.showerror("卡片修改失败", str(exc), parent=self)
@@ -1133,8 +1136,13 @@ class TrainerApp(tk.Tk):
             messagebox.showerror("无法应用", "请先勾选要修改的卡片", parent=self)
             return
         try:
-            self._write("卡片修改", lambda game: game.apply_cards(indices, safe_max=True), "sugoroku",
-                        f"已将 {len(indices)} 张卡片设为各自实时上限 - 1，并完成卡片回读", fields="cards")
+            self._submit_write(
+                "卡片修改",
+                write=lambda game: game.apply_cards(indices, safe_max=True),
+                read_back=lambda game: game.read_sugoroku_cards(),
+                apply_readback=self._apply_cards_readback,
+                message=f"已将 {len(indices)} 张卡片设为各自实时上限 - 1，并完成卡片回读",
+            )
         except Exception as exc:
             self.status_var.set("卡片修改失败")
             messagebox.showerror("卡片修改失败", str(exc), parent=self)
@@ -1144,13 +1152,19 @@ class TrainerApp(tk.Tk):
             count = self.parse_number(self.dice_count_var.get(), "骰子数量", 3, 1)
             value = self.parse_number(self.dice_step_var.get(), "总步数", 99, count)
             locked = self.lock_step_var.get()
-            def run(game):
+            def write(game):
                 if locked:
-                    game.ensure_backup()
-                    return game.set_step_lock(value, count)
-                return game.apply_sugoroku({"step": value, "diceCount": count})
-            self._write("步数修改", run, "sugoroku",
-                        f"已设置 {count} 颗骰子合计 {value} 步（{'持续锁定' if locked else '下一次投掷'}）", fields="step")
+                    game.set_step_lock(value, count)
+                else:
+                    game.set_next_roll_steps(value, count)
+
+            self._submit_write(
+                "步数修改",
+                write=write,
+                read_back=lambda game: game.read_sugoroku_step(),
+                apply_readback=lambda data: self._apply_sugoroku_readback(data, self._show_sugoroku_step),
+                message=f"已设置 {count} 颗骰子合计 {value} 步（{'持续锁定' if locked else '下一次投掷'}）",
+            )
         except Exception as exc:
             messagebox.showerror("步数修改失败", str(exc), parent=self)
 
@@ -1161,13 +1175,12 @@ class TrainerApp(tk.Tk):
             value = self.parse_number(self.dice_step_var.get(), "总步数", 99, count) if enabled else 0
             def run(game):
                 if enabled:
-                    game.ensure_backup()
                     return game.set_step_lock(value, count)
                 return game.clear_step_lock()
             def done(_result):
                 self.lock_step_var.set(enabled)
-                if self.state:
-                    self.state["sugoroku"]["stepLocked"] = enabled
+                if self.snapshot:
+                    self.snapshot["sugoroku"]["stepLocked"] = enabled
                 self.status_var.set(f"已启用步数锁定：{count} 颗骰子合计 {value} 步" if enabled else "已停用步数锁定")
             accepted = self._submit("设置步数锁定", run, done, lambda _exc: self.lock_step_var.set(not enabled))
             if not accepted:
@@ -1178,9 +1191,9 @@ class TrainerApp(tk.Tk):
 
     def apply_goto(self):
         try:
-            if not self.state:
+            if not self.snapshot:
                 raise ValueError("请先刷新读取数据")
-            board = self.state["sugoroku"].get("board") or {}
+            board = self.snapshot["sugoroku"].get("board") or {}
             if not board.get("ready"):
                 raise ValueError("双六对局数据尚未初始化，请进入双六屋后刷新")
             grid_max = board.get("gridMax", 0)
@@ -1188,15 +1201,12 @@ class TrainerApp(tk.Tk):
             current = board.get("pos", 0)
             if target <= current:
                 raise ValueError(f"目标格必须大于当前所在格数（当前第 {current} 格）")
-            def run(game):
-                game.ensure_backup()
-                return game.set_goto_cell(target)
             def done(result):
                 self.goto_status_var.set(
                     f"目标：第 {target} 格（第 {result['level'] + 1} 关，当前第 {result['pos']} 格，本关共 {result['gridMax']} 格）"
                 )
                 self.status_var.set(f"已设置目标格 {target}，下一次投掷将自动走过去")
-            self._submit("设置目标格", run, done)
+            self._submit("设置目标格", lambda game: game.set_goto_cell(target), done)
         except Exception as exc:
             self.status_var.set("目标格设置失败")
             messagebox.showerror("目标格设置失败", str(exc), parent=self)
@@ -1221,8 +1231,8 @@ class TrainerApp(tk.Tk):
     def refresh_board(self):
         def done(info):
             board = info.get("board") or {}
-            if self.state is not None:
-                self.state["sugoroku"]["board"] = board
+            if self.snapshot is not None:
+                self.snapshot["sugoroku"]["board"] = board
             self._update_board_ui(board)
             notice = info.get("gotoNotice")
             if notice:
@@ -1230,20 +1240,27 @@ class TrainerApp(tk.Tk):
             elif info.get("gotoTarget") is not None:
                 self.goto_status_var.set(f"目标：第 {info['gotoTarget']} 格（已设置，等待下一次投掷）")
             self.status_var.set("已刷新棋盘位置")
-        self._submit("刷新棋盘", lambda game: game.read_board(), done)
+        self._submit("刷新棋盘", lambda game: game.read_board_state(), done)
 
     def apply_dice_remaining(self):
         try:
-            if not self.state:
+            if not self.snapshot:
                 raise ValueError("请先刷新读取数据")
-            maximum = self.state["sugoroku"].get("maximum", 3)
+            maximum = self.snapshot["sugoroku"].get("maximum", 3)
             value = self.parse_number(self.dice_remaining_var.get(), "剩余投掷次数", maximum)
-            def written(_result):
+            def on_written():
                 if self.lock_remaining_var.get():
                     self._lock_target_value = value
                     self._lock_failures = 0
-            if not self._write("次数修改", lambda game: game.apply_sugoroku({"remaining": value}), "sugoroku",
-                               f"已将剩余投掷次数设为 {value}，并完成范围回读", fields="remaining", written=written):
+
+            if not self._submit_write(
+                "次数修改",
+                write=lambda game: game.set_sugoroku_remaining(value),
+                read_back=lambda game: game.read_sugoroku_remaining(),
+                apply_readback=lambda data: self._apply_sugoroku_readback(data, self._show_sugoroku_remaining),
+                message=f"已将剩余投掷次数设为 {value}，并完成范围回读",
+                on_written=on_written,
+            ):
                 self.status_var.set("操作被占用，请稍后重试")
         except Exception as exc:
             messagebox.showerror("次数修改失败", str(exc), parent=self)
@@ -1251,8 +1268,13 @@ class TrainerApp(tk.Tk):
     def apply_kairo_point(self):
         try:
             value = self.parse_number(self.kairo_point_var.get(), "开罗点数", 2147483647)
-            self._write("开罗点数修改", lambda game: game.apply_sugoroku({"kairoPoint": value}), "sugoroku",
-                        f"已将开罗点数设为 {value}，并完成范围回读", fields="kairoPoint")
+            self._submit_write(
+                "开罗点数修改",
+                write=lambda game: game.write_kairo_point(value),
+                read_back=lambda game: game.read_kairo_point(),
+                apply_readback=lambda data: self._apply_sugoroku_readback(data, self._show_kairo_point),
+                message=f"已将开罗点数设为 {value}，并完成范围回读",
+            )
         except Exception as exc:
             messagebox.showerror("开罗点数修改失败", str(exc), parent=self)
 
@@ -1263,13 +1285,10 @@ class TrainerApp(tk.Tk):
             self.status_var.set("已停用剩余投掷次数锁定")
             return
         try:
-            if not self.state:
+            if not self.snapshot:
                 raise ValueError("请先刷新读取数据")
-            maximum = self.state["sugoroku"].get("maximum", 3)
+            maximum = self.snapshot["sugoroku"].get("maximum", 3)
             target = self.parse_number(self.dice_remaining_var.get(), "剩余投掷次数", maximum)
-            def run(game):
-                game.ensure_backup()
-                return game.write_sugoroku_remaining(target)
             def done(result):
                 self._lock_target_value = target
                 self._lock_failures = 0
@@ -1279,7 +1298,7 @@ class TrainerApp(tk.Tk):
             def failed(_error):
                 self.lock_remaining_var.set(False)
                 self._stop_lock_remaining()
-            if not self._submit("启用次数锁定", run, done, failed):
+            if not self._submit("启用次数锁定", lambda game: game.write_sugoroku_remaining(target), done, failed):
                 self.lock_remaining_var.set(False)
         except Exception as exc:
             self.lock_remaining_var.set(False)
@@ -1313,8 +1332,8 @@ class TrainerApp(tk.Tk):
             info, value = result
             self._lock_target_value = value
             self._lock_failures = 0
-            if self.state:
-                self.state["sugoroku"]["remaining"] = info["remaining"]
+            if self.snapshot:
+                self.snapshot["sugoroku"]["remaining"] = info["remaining"]
             self._schedule_lock()
         def failed(error):
             self._lock_failures += 1
@@ -1449,11 +1468,8 @@ class TrainerApp(tk.Tk):
         self._geometry_ready = False
         self._last_window_state = "zoomed" if self.settings.get("window_maximized", False) else "normal"
         if self._last_window_state == "zoomed":
-            self.state_window("zoomed")
+            self.state("zoomed")
         self._geometry_enable_timer_id = self.after(800, self._enable_geometry_tracking)
-
-    def state_window(self, value=None):
-        return super().state(value) if value is not None else super().state()
 
     def _enable_geometry_tracking(self):
         self._geometry_enable_timer_id = None
@@ -1463,7 +1479,7 @@ class TrainerApp(tk.Tk):
     def _window_changed(self, event):
         if event.widget is not self or self._closing or not getattr(self, "_geometry_ready", False):
             return
-        current = self.state_window()
+        current = self.state()
         if current not in ("normal", "zoomed"):
             return
         self._capture_geometry()
@@ -1472,7 +1488,7 @@ class TrainerApp(tk.Tk):
         self._geometry_timer_id = self.after(600, self._save_geometry)
 
     def _capture_geometry(self):
-        current = self.state_window()
+        current = self.state()
         if current == "normal":
             self._normal_geometry = self.geometry()
         self.settings["window_geometry"] = self._normal_geometry
@@ -1490,14 +1506,14 @@ class TrainerApp(tk.Tk):
         return cleaned or fallback
 
     def on_crew_selected(self, _event):
-        if self.state and self.state["crews"]:
-            self.selected_crew = self.crew_selector.current()
+        if self.snapshot and self.snapshot["crews"]:
+            self.crew_position = self.crew_selector.current()
             self.load_crew_form()
 
     def load_crew_form(self):
-        if not self.state or not self.state["crews"]:
+        if not self.snapshot or not self.snapshot["crews"]:
             return
-        crew = self.state["crews"][self.selected_crew]
+        crew = self.snapshot["crews"][self.crew_position]
         for key in self.crew_vars:
             self.crew_vars[key].set(str(crew[key]))
         for index in range(6):
@@ -1543,7 +1559,7 @@ class TrainerApp(tk.Tk):
         return number
 
     def apply_resources(self):
-        if not self.state:
+        if not self.snapshot:
             self.status_var.set("请先刷新读取数据")
             return
         changes = {}
@@ -1558,24 +1574,37 @@ class TrainerApp(tk.Tk):
         if not changes:
             self.status_var.set("没有可写入的资源（全部已跳过）：" + "；".join(skipped))
             return
-        def written(_result):
+        def on_written():
             for key, value in changes.items():
                 if key in self._resource_lock_targets:
                     self._resource_lock_targets[key] = value
         message = f"已将 {len(changes)} 项基础资源写入并完成回读"
         if skipped:
             message += "；已跳过 " + "；".join(skipped)
-        if not self._write("资源应用", lambda game: game.apply_changes(changes), "resources", message,
-                           fields=tuple(changes), written=written):
+        if not self._submit_write(
+            "资源应用",
+            write=lambda game: game.write_resources(changes),
+            read_back=lambda game: game.read_resources(),
+            apply_readback=lambda data: self._apply_resources_readback(data, changes),
+            message=message,
+            on_written=on_written,
+        ):
             self.status_var.set("资源应用被占用，请稍后重试")
 
+    def _apply_resources_readback(self, data, submitted_keys):
+        if self.snapshot is not None:
+            self.snapshot.update(data)
+        for key in submitted_keys:
+            self.resource_vars[key].set(str(data[key]))
+        self._update_resource_warning()
+
     def _update_resource_warning(self):
-        if not self.state:
+        if not self.snapshot:
             self.resource_warn_var.set("")
             return
         problems = []
         for key, label in RESOURCE_FIELDS:
-            value = self.state.get(key)
+            value = self.snapshot.get(key)
             if not isinstance(value, int):
                 continue
             if value < 0:
@@ -1598,12 +1627,12 @@ class TrainerApp(tk.Tk):
             self.status_var.set(f"已停用{label}锁定")
             return
         try:
-            if not self.state:
+            if not self.snapshot:
                 raise ValueError("请先刷新读取数据")
             maximum = RESOURCE_INPUT_MAX.get(key, RESOURCE_SAFE_MAX)
             target = self.parse_number(self.resource_vars[key].get(), label, maximum)
             def run(game):
-                return game.apply_changes({key: target})
+                return game.write_resources({key: target})
             def done(_result):
                 self._resource_lock_targets[key] = target
                 self._resource_lock_failures = 0
@@ -1650,7 +1679,7 @@ class TrainerApp(tk.Tk):
             data = game.read_resources()
             changes = {key: value for key, value in targets.items() if data.get(key) != value}
             if changes:
-                game.apply_changes(changes)
+                game.write_resources(changes)
                 data = game.read_resources()
             return data, targets
         def done(payload):
@@ -1659,8 +1688,8 @@ class TrainerApp(tk.Tk):
                 if key in self._resource_lock_targets:
                     self._resource_lock_targets[key] = value
             self._resource_lock_failures = 0
-            if self.state:
-                self.state.update(data)
+            if self.snapshot:
+                self.snapshot.update(data)
             # 不回写输入框：锁定轮询每 700ms 一次，若把读回值写进 Entry，会覆盖用户
             # 正在输入的内容（包括未锁定的资源项），表现为输入被“自动刷新掉”。
             # Entry 始终保留用户的目标值；需要读取游戏当前值时使用“刷新数值”。
@@ -1701,19 +1730,24 @@ class TrainerApp(tk.Tk):
                 )
 
     def apply_crew_restore(self):
-        if not self.state or not self.state["crews"]:
+        if not self.snapshot or not self.snapshot["crews"]:
             messagebox.showerror("无法应用", "没有可编辑的船员，请先刷新", parent=self)
             return
         try:
-            crew = {"index": self.state["crews"][self.selected_crew]["index"], "restoreBattle": True}
-            self._write("恢复战斗 HP/SP", lambda game: game.apply_changes({"crews": [crew]}), "crew",
-                        "已按游戏当前计算上限恢复战斗 HP/SP", fields="battle", crew_index=crew["index"])
+            index = self.snapshot["crews"][self.crew_position]["index"]
+            self._submit_write(
+                "恢复战斗 HP/SP",
+                write=lambda game: game.restore_crew_battle(index),
+                read_back=lambda game: game.read_crew_battle(index),
+                apply_readback=self._apply_crew_battle_readback,
+                message="已按游戏当前计算上限恢复战斗 HP/SP",
+            )
         except Exception as exc:
             self.status_var.set("恢复失败")
             messagebox.showerror("恢复失败", str(exc), parent=self)
 
     def apply_crew_max(self):
-        if not self.state or not self.state["crews"]:
+        if not self.snapshot or not self.snapshot["crews"]:
             messagebox.showerror("无法应用", "没有可编辑的船员，请先刷新", parent=self)
             return
         for var in self.param_vars:
@@ -1723,24 +1757,41 @@ class TrainerApp(tk.Tk):
         self.apply_crew()
 
     def apply_crew(self):
-        if not self.state or not self.state["crews"]:
+        if not self.snapshot or not self.snapshot["crews"]:
             messagebox.showerror("无法应用", "没有可编辑的船员，请先刷新", parent=self)
             return
         try:
-            changes = {}
-            crew = {"index": self.state["crews"][self.selected_crew]["index"]}
+            index = self.snapshot["crews"][self.crew_position]["index"]
+            crew = {"index": index}
             for key, var in self.crew_vars.items():
                 crew[key] = self.parse_number(var.get(), key)
             crew["params"] = [self.parse_number(var.get(), f"基础{PARAM_NAMES[i]}") for i, var in enumerate(self.param_vars)]
             crew["addParams"] = [self.parse_number(var.get(), f"成长{PARAM_NAMES[i]}") for i, var in enumerate(self.add_param_vars)]
             self.check_crew_param_limits(crew)
-            changes["crews"] = [crew]
-            self._write("船员应用", lambda game: game.apply_changes(changes), "crew",
-                        f"船员属性已写入并完成回读；备份目录：{self.settings.get('backup_root', DEFAULT_BACKUP_ROOT)}",
-                        crew_index=crew["index"])
+            self._submit_write(
+                "船员应用",
+                write=lambda game: game.update_crew(crew),
+                read_back=lambda game: game.read_crew(index),
+                apply_readback=self._apply_crew_readback,
+                message=f"船员属性已写入并完成回读；备份目录：{self.settings.get('backup_root', DEFAULT_BACKUP_ROOT)}",
+            )
         except Exception as exc:
             self.status_var.set("船员应用失败")
             messagebox.showerror("船员应用失败", str(exc), parent=self)
+
+    def _apply_crew_battle_readback(self, data):
+        if self.snapshot is None:
+            return
+        self.snapshot["crews"][data["index"]].update(data)
+        for key in ("battleHP", "battleSP"):
+            self.crew_vars[key].set(str(data[key]))
+
+    def _apply_crew_readback(self, crew):
+        if self.snapshot is None:
+            return
+        self.snapshot["crews"][crew["index"]] = crew
+        self._update_crew_choices()
+        self.load_crew_form()
 
     def on_close(self):
         if self._closing:
